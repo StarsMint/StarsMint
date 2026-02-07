@@ -1,4 +1,5 @@
 import telebot
+from keep_alive import keep_alive
 from telebot import types
 import sqlite3
 import time
@@ -363,6 +364,7 @@ def notify_on_restart():
 
 if __name__ == "__main__":
     print("Bot started with Multi-API rotation...")
+    keep_alive()
     notify_on_restart()
     try:
         bot.infinity_polling(timeout=10, long_polling_timeout=5)
