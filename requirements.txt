@@ -1,0 +1,8 @@
+Flask
+telebot
+requests
+bip_utils
+pyTelegramBotAPI
+requests
+bip_utils
+schedule
