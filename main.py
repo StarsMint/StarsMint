@@ -27,9 +27,9 @@ def keep_alive():
 # ==========================================
 # 2. إعدادات التيليجرام (Telegram Handler) 📢
 # ==========================================
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN") 
+TELEGRAM_TOKEN = "8053838829:AAHo1iTJm958nIBgOoinGZpwTdm467lCBT4"
 
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID") 
+TELEGRAM_CHAT_ID = 1801208219 
 
 def send_telegram_msg(message):
     try:
@@ -60,9 +60,9 @@ def send_telegram_msg(message):
 # ==========================================
 # 3. محرك OKX (The Engine) ⚙️
 # ==========================================
-api_key = os.environ.get('OKX_API_KEY')
-secret_key = os.environ.get('OKX_SECRET_KEY')
-password = os.environ.get('OKX_PASSWORD')
+api_key = "263d6dec-23fd-41fb-bd8d-6ba9f626ca1c"
+secret_key = "68BF1CE4388551F4AE9B5E8E3AFD1F23"
+password = "Olpolp2004$"
 
 exchange = ccxt.okx({
     'apiKey': api_key,
