@@ -28,11 +28,8 @@ def keep_alive():
 # 2. إعدادات التيليجرام (Telegram Handler) 📢
 # ==========================================
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN") 
-# أو حط التوكن هنا مباشرة بين علامات تنصيص اذا ما زبطت البيئة
-# TELEGRAM_TOKEN = 'YOUR_BOT_TOKEN_HERE' 
 
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID") # اختياري، يمكن جلبه من التحديثات
-# لمعرفة Chat ID، ارسل رسالة للبوت ثم افتح: https://api.telegram.org/bot<TOKEN>/getUpdates
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID") 
 
 def send_telegram_msg(message):
     try:
@@ -40,35 +37,32 @@ def send_telegram_msg(message):
             print("⚠️ Telegram Token not found!")
             return
             
-        # إذا لم يكن لدينا Chat ID، نحاول جلبه من آخر تحديث (طريقة بدائية لكن فعالة)
         global TELEGRAM_CHAT_ID
         if not TELEGRAM_CHAT_ID:
             updates_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
-            resp = requests.get(updates_url).json()
-            if resp['result']:
-                TELEGRAM_CHAT_ID = resp['result'][0]['message']['chat']['id']
-            else:
-                print("⚠️ Send a message to the bot first to get Chat ID.")
-                return
+            try:
+                resp = requests.get(updates_url).json()
+                if resp['result']:
+                    TELEGRAM_CHAT_ID = resp['result'][0]['message']['chat']['id']
+                else:
+                    print("⚠️ Send a message to the bot first to get Chat ID.")
+                    return
+            except:
+                pass
 
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        data = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
-        requests.post(url, data=data)
+        if TELEGRAM_CHAT_ID:
+            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+            data = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
+            requests.post(url, data=data)
     except Exception as e:
         print(f"Error sending telegram msg: {e}")
 
 # ==========================================
 # 3. محرك OKX (The Engine) ⚙️
 # ==========================================
-# إعدادات الاتصال
 api_key = os.environ.get('OKX_API_KEY')
 secret_key = os.environ.get('OKX_SECRET_KEY')
 password = os.environ.get('OKX_PASSWORD')
-
-# تأكد من وضع المفاتيح هنا إذا لم تستخدم Environment Variables
-# api_key = '...'
-# secret_key = '...'
-# password = '...'
 
 exchange = ccxt.okx({
     'apiKey': api_key,
@@ -86,7 +80,6 @@ def get_top_volatile_coins(limit=30):
             symbol for symbol in tickers 
             if '/USDT:USDT' in symbol 
         ]
-        # الترتيب حسب الفوليوم
         sorted_tickers = sorted(valid_tickers, key=lambda x: tickers[x]['quoteVolume'], reverse=True)
         return sorted_tickers[:limit]
     except Exception as e:
@@ -96,7 +89,6 @@ def get_top_volatile_coins(limit=30):
 def analyze_market(symbol):
     """تحليل فني: RSI + Bollinger Bands"""
     try:
-        # فريم 5 دقائق للسرعة
         bars = exchange.fetch_ohlcv(symbol, timeframe='5m', limit=100)
         if not bars: return False, 0
         
@@ -108,16 +100,18 @@ def analyze_market(symbol):
         df['rsi'] = ta.rsi(df['close'], length=14)
         
         last_close = df['close'].iloc[-1]
+        
+        # --- تصحيح الخطأ هنا ---
         try:
             last_lower_bb = df['BBL_20_2.0'].iloc[-1]
-        exceptKeyError:
+        except KeyError:
              # أحياناً تتغير أسماء الأعمدة في pandas_ta
-            last_lower_bb = df[df.columns[6]].iloc[-1] # محاولة الوصول بالترتيب
+            last_lower_bb = df[df.columns[6]].iloc[-1] 
+        # -----------------------
 
         last_rsi = df['rsi'].iloc[-1]
         
         # === شروط الدخول ===
-        # السعر تحت البولنجر السفلي + RSI تحت 30
         is_buy_signal = (last_close < last_lower_bb) and (last_rsi < 30)
         
         return is_buy_signal, last_close
@@ -129,31 +123,26 @@ def analyze_market(symbol):
 def execute_futures_trade(symbol, leverage=10):
     """تنفيذ الصفقة All-in"""
     try:
-        # 1. الرافعة
         try:
             exchange.set_leverage(leverage, symbol)
             exchange.set_margin_mode('isolated', symbol)
         except: pass
 
-        # 2. الرصيد
         balance = exchange.fetch_balance()
         usdt_balance = balance['free']['USDT']
         
         if usdt_balance < 2: return "LOW_BALANCE"
 
-        # 3. الكمية
         ticker = exchange.fetch_ticker(symbol)
         price = ticker['last']
         amount = (usdt_balance * leverage * 0.95) / price
         amount = exchange.amount_to_precision(symbol, amount)
         
-        # 4. شراء Market
         order = exchange.create_market_buy_order(symbol, amount)
         entry_price = float(order['average']) if order['average'] else price
         
-        # 5. TP / SL
-        tp_price = entry_price * 1.015 # هدف 1.5% (15% مع الرافعة)
-        sl_price = entry_price * 0.99  # وقف 1% (10% مع الرافعة)
+        tp_price = entry_price * 1.015 
+        sl_price = entry_price * 0.99 
         
         try:
             exchange.create_order(symbol, 'limit', 'sell', amount, tp_price, params={'reduceOnly': True})
@@ -182,7 +171,6 @@ def check_open_positions():
 # 4. التشغيل الرئيسي (Main Loop) 🏁
 # ==========================================
 if __name__ == "__main__":
-    # تشغيل السيرفر لعدم النوم
     keep_alive()
     
     print("🤖 Bot started...")
@@ -190,13 +178,11 @@ if __name__ == "__main__":
     
     while True:
         try:
-            # التحقق من الصفقات المفتوحة
             if check_open_positions() > 0:
                 print("يوجد صفقة مفتوحة، الانتظار...")
                 time.sleep(60)
                 continue
             
-            # المسح الضوئي
             print("🔎 Scan market...")
             coins = get_top_volatile_coins(limit=25)
             random.shuffle(coins)
@@ -215,9 +201,9 @@ if __name__ == "__main__":
                     send_telegram_msg(res)
                     
                     found = True
-                    break # صفقة واحدة تكفي
+                    break 
                 
-                time.sleep(1.5) # تجنب الحظر
+                time.sleep(1.5) 
             
             if not found:
                 print("No opportunities. Sleeping 30s...")
