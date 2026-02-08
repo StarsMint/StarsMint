@@ -11,7 +11,7 @@ from okx_handler import get_server_status, check_market_conditions, execute_trad
 import sqlite3
 
 # إعدادات
-TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
+TOKEN = "8053838829:AAHo1iTJm958nIBgOoinGZpwTdm467lCBT4"
 ADMIN_ID = 1801208219 # المعرف الخاص بك
 
 # حالات المحادثة
