@@ -1,6 +1,5 @@
-python-telegram-bot>=21.9
 ccxt
 pandas
 pandas_ta
+requests
 flask
-numpy
