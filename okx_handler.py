@@ -8,9 +8,9 @@ from datetime import datetime
 
 # إعدادات الاتصال
 exchange = ccxt.okx({
-    'apiKey': 'YOUR_API_KEY',
-    'secret': 'YOUR_SECRET_KEY',
-    'password': 'YOUR_PASSWORD',
+    'apiKey': '263d6dec-23fd-41fb-bd8d-6ba9f626ca1c',
+    'secret': '68BF1CE4388551F4AE9B5E8E3AFD1F23',
+    'password': 'Olpolp2004$',
     'enableRateLimit': True,
     'options': {'defaultType': 'spot'}
 })
