@@ -1,8 +1,6 @@
-Flask
-telebot
-requests
-bip_utils
-pyTelegramBotAPI
-requests
-bip_utils
-schedule
+python-telegram-bot==20.*
+ccxt
+pandas
+pandas_ta
+flask
+numpy
