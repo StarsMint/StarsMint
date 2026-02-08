@@ -18,8 +18,8 @@ from database import init_db, get_strategy, create_strategy, delete_strategy
 from okx_handler import get_server_status, check_market_conditions, execute_trade, check_open_orders_status, exchange
 
 # إعدادات التوكن
-TOKEN = os.getenv('TELEGRAM_TOKEN')
-ADMIN_ID = int(os.getenv('ADMIN_ID', 1801208219))
+TOKEN = "8053838829:AAHo1iTJm958nIBgOoinGZpwTdm467lCBT4"
+ADMIN_ID = 1801208219
 
 # مراحل المحادثة
 SET_PROFIT, SET_COINS = range(2)
