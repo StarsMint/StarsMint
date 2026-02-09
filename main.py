@@ -62,7 +62,7 @@ MAX_FREE_DAILY     = 20
 MAX_TWEETS_DAILY   = 17
 SCAN_INTERVAL      = 60        # seconds between full scans
 MONITOR_INTERVAL   = 15        # seconds between TP/SL checks
-SIGNAL_COOLDOWN    = 300       # per-symbol cooldown (seconds)
+SIGNAL_COOLDOWN    = 60       # per-symbol cooldown (seconds)
 SIGNAL_EXPIRY_H    = 24        # close signal after N hours
 
 VOL_SPIKE_MULT     = 3.0       # volume must be Nx average
