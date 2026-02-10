@@ -582,8 +582,8 @@ class Detector:
                 sl = max(below[-1], price - _atr * 2)
             else:
                 sl = price - _atr * 2
-            sl = max(sl, price * 0.92)
-            sl = min(sl, price * 0.97)
+            sl = max(sl, price * 0.90)
+            sl = min(sl, price * 0.90)
 
             risk = price - sl
             reward = tp1 - price
