@@ -1,3 +1,4 @@
+import gc
 import os
 import asyncio
 import logging
@@ -250,6 +251,19 @@ MINI_APP_HTML = """
         .payment-modal.active {
             display: flex;
         }
+        
+            <div style="margin-top: 20px; padding-top: 20px; border-top: 1px solid rgba(255,255,255,0.2);">
+                <p style="font-size: 14px; color: #aaa;">Or pay manually:</p>
+                
+                <button onclick="payWithDeepLink()" style="background: #0098ea; margin-bottom: 15px;">
+                    Open Wallet App ↗️
+                </button>
+
+                <p style="font-size: 14px; color: #aaa;">Or copy address:</p>
+                <div class="wallet-address" id="walletAddress" onclick="copyWallet()">
+                    UQABSEcWzJVmtLdZDUMyCs5EGrKOHWKWq3ftFNY0IItHgYTa
+                </div>
+
         
         .payment-content {
             background: linear-gradient(135deg, #2d2d2d 0%, #1a1a1a 100%);
@@ -525,6 +539,7 @@ MINI_APP_HTML = """
                 video.controlsList = "nodownload";
                 video.disablePictureInPicture = true;
                 video.autoplay = true;
+                video.loop = true;
                 mediaContainer.insertBefore(video, mediaContainer.firstChild);
                 
                 if (!data.has_access && data.duration) {
@@ -579,6 +594,50 @@ MINI_APP_HTML = """
                 requiredTonAmount = 0.20;
             }
         }
+        
+        async function payWithDeepLink() {
+            const button = document.querySelector('button[onclick="payWithDeepLink()"]');
+            const originalText = button.innerText;
+            button.innerText = "Loading...";
+            
+            try {
+                // 1. نطلب من السيرفر إنشاء عملية دفع لتسجيلها
+                const response = await fetch("/api/create-payment", {
+                    method: "POST",
+                    headers: {"Content-Type": "application/json"},
+                    body: JSON.stringify({
+                        ticket: currentTicket,
+                        user_id: tg.initDataUnsafe?.user?.id || 0
+                    })
+                });
+                
+                const data = await response.json();
+                
+                if (data.success) {
+                    // 2. تشغيل المراقبة للتأكد من وصول الدفع
+                    if (!paymentCheckInterval) {
+                        checkPaymentStatus(data.payment_id);
+                    }
+
+                    // 3. تجهيز رابط الدفع العميق
+                    // الصيغة: ton://transfer/<ADDRESS>?amount=<NANO>&text=<COMMENT>
+                    const address = data.wallet_address;
+                    const amount = data.amount_nano;
+                    const comment = data.comment;
+                    
+                    const deepLink = `ton://transfer/${address}?amount=${amount}&text=${comment}`;
+                    
+                    // 4. فتح المحفظة
+                    window.location.href = deepLink;
+                }
+            } catch (e) {
+                console.error("Error opening wallet:", e);
+                alert("Could not open wallet automatically. Please copy the address.");
+            } finally {
+                button.innerText = originalText;
+            }
+        }
+
         
         function closePaymentModal() {
             document.getElementById("paymentModal").classList.remove("active");
@@ -783,13 +842,16 @@ def get_content():
         if user_key in user_access and ticket in user_access[user_key]:
             user_ticket_data = user_access[user_key][ticket]
             
-            if user_ticket_data.get("fingerprint") != fingerprint:
-                return jsonify({"success": False, "error": "Unauthorized access detected"})
+        if user_key in user_access and ticket in user_access[user_key]:
+            user_ticket_data = user_access[user_key][ticket]
+            
+            # --- تم تعطيل الحماية للسماح بتعدد الأجهزة ---
+            # if user_ticket_data.get("fingerprint") != fingerprint:
+            #     return jsonify({"success": False, "error": "Unauthorized access detected"})
+            # ---------------------------------------------
             
             if user_ticket_data.get("paid"):
                 paid_at = datetime.fromisoformat(user_ticket_data.get("paid_at", ticket_data["created_at"]))
-                if datetime.now() - paid_at <= timedelta(days=TICKET_EXPIRY_DAYS):
-                    has_paid_access = True
         else:
             if user_key not in user_access:
                 user_access[user_key] = {}
@@ -923,6 +985,32 @@ def check_payment():
     except Exception as e:
         logger.error(f"Check payment error: {e}")
         return jsonify({"paid": False, "error": str(e)})
+        
+async def clean_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # الحماية: التأكد أن المرسل هو الأدمن فقط
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    # 1. مسح جميع التذاكر والمحتوى (فيديوهات وصور)
+    tickets_storage.clear()
+    
+    # 2. مسح جميع عمليات الدفع المعلقة
+    pending_payments.clear()
+    
+    # 3. (اختياري) مسح سجلات دخول المستخدمين
+    # ملاحظة: هذا سيمسح بيانات من دفعوا سابقاً، لكن بما أن التذاكر حذفت فلا يهم
+    user_access.clear()
+
+    # 4. إجبار النظام على تنظيف الذاكرة فوراً
+    gc.collect()
+    
+    await update.message.reply_text(
+        "🧹 **Memory Cleaned!**\n\n"
+        "All tickets, media, and pending payments have been deleted.\n"
+        "Server memory is now free.",
+        parse_mode="Markdown"
+    )
+
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -1035,6 +1123,16 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
             media_type = "video"
             duration = video.duration if video.duration else 120
             
+            # --- إضافة: حفظ الصورة المصغرة (Thumbnail) ---
+            thumbnail_data = None
+            if video.thumbnail:
+                thumb_file = await context.bot.get_file(video.thumbnail.file_id)
+                thumb_bytes = await thumb_file.download_as_bytearray()
+                # إضافة العلامة المائية للصورة المصغرة أيضاً (اختياري)
+                watermarked_thumb = add_watermark(bytes(thumb_bytes))
+                thumbnail_data = base64.b64encode(watermarked_thumb).decode()
+            # ---------------------------------------------
+            
         elif update.message.document:
             document = update.message.document
             if document.mime_type and "video" in document.mime_type:
@@ -1056,7 +1154,8 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "media_data": media_data,
                 "created_at": datetime.now().isoformat(),
                 "title": "",
-                "duration": duration
+                "duration": duration,
+                "thumbnail": thumbnail_data if 'thumbnail_data' in locals() else None  # <--- أضف هذا السطر
             }
             
             context.user_data["pending_ticket"] = ticket_id
@@ -1110,6 +1209,7 @@ async def post_to_group(bot, ticket_id, title):
             f"4. Watch free or pay for full access"
         )
         
+        # إذا كان المحتوى صورة
         if ticket_data["media_type"] == "image":
             image_bytes = base64.b64decode(ticket_data["media_data"])
             await bot.send_photo(
@@ -1119,6 +1219,19 @@ async def post_to_group(bot, ticket_id, title):
                 reply_markup=reply_markup,
                 parse_mode="Markdown"
             )
+        
+        # إذا كان فيديو ولديه صورة مصغرة (Thumbnail)
+        elif ticket_data.get("thumbnail"):
+            thumb_bytes = base64.b64decode(ticket_data["thumbnail"])
+            await bot.send_photo(
+                chat_id=GROUP_CHAT_ID,
+                photo=BytesIO(thumb_bytes), # نرسل الصورة المصغرة
+                caption=message_text,       # النص يكون كابشن للصورة
+                reply_markup=reply_markup,
+                parse_mode="Markdown"
+            )
+            
+        # إذا كان فيديو ولا يوجد صورة مصغرة (احتياط)
         else:
             await bot.send_message(
                 chat_id=GROUP_CHAT_ID,
