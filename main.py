@@ -252,15 +252,6 @@ MINI_APP_HTML = """
             display: flex;
         }
         
-            <div style="margin-top: 20px; padding-top: 20px; border-top: 1px solid rgba(255,255,255,0.2);">
-                <p style="font-size: 14px; color: #aaa;">Or pay manually:</p>
-                
-                <p style="font-size: 14px; color: #aaa;">Or copy address:</p>
-                <div class="wallet-address" id="walletAddress" onclick="copyWallet()">
-                    UQABSEcWzJVmtLdZDUMyCs5EGrKOHWKWq3ftFNY0IItHgYTa
-                </div>
-
-        
         .payment-content {
             background: linear-gradient(135deg, #2d2d2d 0%, #1a1a1a 100%);
             border-radius: 20px;
