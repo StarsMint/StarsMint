@@ -1,9 +1,8 @@
+Flask
 python-telegram-bot
-tweepy
 requests
-flask
-matplotlib
-mplfinance
-pandas
-numpy
 Pillow
+gunicorn
+pytoniq
+pytoniq-core
+tonsdk
