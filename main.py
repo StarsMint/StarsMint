@@ -595,79 +595,34 @@ MINI_APP_HTML = """
             }
         }
         
-async function payWithDeepLink() {
-    // 1. تحديد الزر وحفظ نصه الأصلي
-    const button = document.querySelector('button[onclick="payWithDeepLink()"]');
-    const originalText = button.innerText;
-    
-    // منع النقر المتكرر وتغيير النص
-    button.disabled = true;
-    button.innerText = "⏳ جاري التحضير...";
-    button.style.opacity = "0.7";
-
-    try {
-        // 2. طلب إنشاء عملية دفع من السيرفر (للحصول على Comment فريد)
-        const response = await fetch("/api/create-payment", {
-            method: "POST",
-            headers: {"Content-Type": "application/json"},
-            body: JSON.stringify({
-                ticket: currentTicket,
-                user_id: tg.initDataUnsafe?.user?.id || 0
-            })
-        });
-        
-        const data = await response.json();
-        
-        if (data.success) {
-            // 3. بدء مراقبة الدفع فوراً في الخلفية
-            // نمرر الـ payment_id ليعرف البوت ماذا يراقب
-            if (paymentCheckInterval) clearInterval(paymentCheckInterval);
-            checkPaymentStatus(data.payment_id);
-
-            // 4. إغلاق النافذة المنبثقة (Modal) لحل مشكلة تغطية الشاشة
-            closePaymentModal();
-            
-            // تحديث رسالة الشاشة الرئيسية ليعرف المستخدم أننا ننتظر
-            const messageDiv = document.getElementById("message");
-            messageDiv.innerHTML = `
-                <div class="payment-status" style="display:block; border-color:#eda514; background:rgba(237,165,20,0.1); text-align:center;">
-                    <div class="loading" style="border-top-color:#eda514; margin-bottom:10px;"></div>
-                    <p>تم فتح المحفظة..</p>
-                    <p style="font-size:12px">بانتظار تأكيد الدفع تلقائياً 🔄</p>
-                </div>`;
-
-            // 5. تجهيز رابط الدفع العميق (Deep Link)
-            // الصيغة: ton://transfer/<ADDRESS>?amount=<NANO>&text=<COMMENT>
-            const address = data.wallet_address;
-            const amount = data.amount_nano; // المبلغ بالنانو (مهم جداً)
-            const comment = data.comment;    // كود التحقق
-            
-            const deepLink = `ton://transfer/${address}?amount=${amount}&text=${comment}`;
-            
-            // 6. التوجيه للمحفظة (مع تأخير نصف ثانية لضمان تحديث الواجهة)
-            setTimeout(() => {
-                window.location.href = deepLink;
+        async function payWithDeepLink() {
+            try {
+                // 1. جلب بيانات الدفع من السيرفر
+                const response = await fetch("/api/create-payment", {
+                    method: "POST",
+                    headers: {"Content-Type": "application/json"},
+                    body: JSON.stringify({
+                        ticket: currentTicket,
+                        user_id: tg.initDataUnsafe?.user?.id || 0
+                    })
+                });
                 
-                // إعادة الزر لحالته (في حال عاد المستخدم للصفحة بسرعة)
-                button.disabled = false;
-                button.innerText = originalText;
-                button.style.opacity = "1";
-            }, 500);
-
-        } else {
-            alert("خطأ: " + (data.error || "فشل إنشاء الطلب"));
-            button.disabled = false;
-            button.innerText = originalText;
-            button.style.opacity = "1";
+                const data = await response.json();
+                
+                if (data.success) {
+                    // 2. إخفاء النافذة فوراً (الحل الجذري)
+                    document.getElementById("paymentModal").style.display = "none";
+                    
+                    // 3. تشغيل المراقب في الخلفية
+                    checkPaymentStatus(data.payment_id);
+                    
+                    // 4. فتح المحفظة
+                    window.location.href = `ton://transfer/${data.wallet_address}?amount=${data.amount_nano}&text=${data.comment}`;
+                }
+            } catch (e) {
+                alert("Error connecting");
+            }
         }
-    } catch (e) {
-        console.error("Payment Error:", e);
-        alert("حدث خطأ في الاتصال، حاول مرة أخرى.");
-        button.disabled = false;
-        button.innerText = originalText;
-        button.style.opacity = "1";
-    }
-}
         
         async function checkPaymentStatus(paymentId) {
             document.getElementById("paymentStatus").style.display = "block";
