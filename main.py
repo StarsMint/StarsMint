@@ -595,56 +595,79 @@ MINI_APP_HTML = """
             }
         }
         
-        async function payWithDeepLink() {
-            const button = document.querySelector('button[onclick="payWithDeepLink()"]');
-            const originalText = button.innerText;
-            button.innerText = "Loading...";
-            
-            try {
-                // 1. نطلب من السيرفر إنشاء عملية دفع لتسجيلها
-                const response = await fetch("/api/create-payment", {
-                    method: "POST",
-                    headers: {"Content-Type": "application/json"},
-                    body: JSON.stringify({
-                        ticket: currentTicket,
-                        user_id: tg.initDataUnsafe?.user?.id || 0
-                    })
-                });
-                
-                const data = await response.json();
-                
-                if (data.success) {
-                    // 2. تشغيل المراقبة للتأكد من وصول الدفع
-                    if (!paymentCheckInterval) {
-                        checkPaymentStatus(data.payment_id);
-                    }
+async function payWithDeepLink() {
+    // 1. تحديد الزر وحفظ نصه الأصلي
+    const button = document.querySelector('button[onclick="payWithDeepLink()"]');
+    const originalText = button.innerText;
+    
+    // منع النقر المتكرر وتغيير النص
+    button.disabled = true;
+    button.innerText = "⏳ جاري التحضير...";
+    button.style.opacity = "0.7";
 
-                    // 3. تجهيز رابط الدفع العميق
-                    // الصيغة: ton://transfer/<ADDRESS>?amount=<NANO>&text=<COMMENT>
-                    const address = data.wallet_address;
-                    const amount = data.amount_nano;
-                    const comment = data.comment;
-                    
-                    const deepLink = `ton://transfer/${address}?amount=${amount}&text=${comment}`;
-                    
-                    // 4. فتح المحفظة
-                    window.location.href = deepLink;
-                }
-            } catch (e) {
-                console.error("Error opening wallet:", e);
-                alert("Could not open wallet automatically. Please copy the address.");
-            } finally {
-                button.innerText = originalText;
-            }
-        }
-
+    try {
+        // 2. طلب إنشاء عملية دفع من السيرفر (للحصول على Comment فريد)
+        const response = await fetch("/api/create-payment", {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({
+                ticket: currentTicket,
+                user_id: tg.initDataUnsafe?.user?.id || 0
+            })
+        });
         
-        function closePaymentModal() {
-            document.getElementById("paymentModal").classList.remove("active");
-            if (paymentCheckInterval) {
-                clearInterval(paymentCheckInterval);
-            }
+        const data = await response.json();
+        
+        if (data.success) {
+            // 3. بدء مراقبة الدفع فوراً في الخلفية
+            // نمرر الـ payment_id ليعرف البوت ماذا يراقب
+            if (paymentCheckInterval) clearInterval(paymentCheckInterval);
+            checkPaymentStatus(data.payment_id);
+
+            // 4. إغلاق النافذة المنبثقة (Modal) لحل مشكلة تغطية الشاشة
+            closePaymentModal();
+            
+            // تحديث رسالة الشاشة الرئيسية ليعرف المستخدم أننا ننتظر
+            const messageDiv = document.getElementById("message");
+            messageDiv.innerHTML = `
+                <div class="payment-status" style="display:block; border-color:#eda514; background:rgba(237,165,20,0.1); text-align:center;">
+                    <div class="loading" style="border-top-color:#eda514; margin-bottom:10px;"></div>
+                    <p>تم فتح المحفظة..</p>
+                    <p style="font-size:12px">بانتظار تأكيد الدفع تلقائياً 🔄</p>
+                </div>`;
+
+            // 5. تجهيز رابط الدفع العميق (Deep Link)
+            // الصيغة: ton://transfer/<ADDRESS>?amount=<NANO>&text=<COMMENT>
+            const address = data.wallet_address;
+            const amount = data.amount_nano; // المبلغ بالنانو (مهم جداً)
+            const comment = data.comment;    // كود التحقق
+            
+            const deepLink = `ton://transfer/${address}?amount=${amount}&text=${comment}`;
+            
+            // 6. التوجيه للمحفظة (مع تأخير نصف ثانية لضمان تحديث الواجهة)
+            setTimeout(() => {
+                window.location.href = deepLink;
+                
+                // إعادة الزر لحالته (في حال عاد المستخدم للصفحة بسرعة)
+                button.disabled = false;
+                button.innerText = originalText;
+                button.style.opacity = "1";
+            }, 500);
+
+        } else {
+            alert("خطأ: " + (data.error || "فشل إنشاء الطلب"));
+            button.disabled = false;
+            button.innerText = originalText;
+            button.style.opacity = "1";
         }
+    } catch (e) {
+        console.error("Payment Error:", e);
+        alert("حدث خطأ في الاتصال، حاول مرة أخرى.");
+        button.disabled = false;
+        button.innerText = originalText;
+        button.style.opacity = "1";
+    }
+}
         
         async function checkPaymentStatus(paymentId) {
             document.getElementById("paymentStatus").style.display = "block";
@@ -1272,6 +1295,7 @@ telegram_app.add_handler(CommandHandler("link", link_command))
 telegram_app.add_handler(CommandHandler("stats", stats_command))
 telegram_app.add_handler(MessageHandler(filters.PHOTO | filters.VIDEO | filters.Document.ALL, handle_media))
 telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+telegram_app.add_handler(CommandHandler("clean", clean_command))
 
 def run_flask():
     app.run(host="0.0.0.0", port=PORT)
