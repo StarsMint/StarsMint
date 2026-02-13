@@ -1,1374 +1,2375 @@
-#!/usr/bin/env python3
-"""
-⚡ EarlySpike — Crypto Signal Sniper Bot
-Telegram + Twitter + OKX | Spot & Futures
-"""
-
-import os, sys, gc, json, time, sqlite3, asyncio, logging, threading, traceback
+import os
+import asyncio
+import logging
+import secrets
+import time
+import json
+import base64
+import hashlib
+from datetime import datetime, timedelta
 from io import BytesIO
-from datetime import datetime, timedelta, timezone
-from dataclasses import dataclass
-from typing import Optional, List, Dict, Tuple, Any
+from threading import Thread
+import uuid
 
-import numpy as np
-import pandas as pd
+from flask import Flask, request, jsonify, render_template_string
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.error import TelegramError
 import requests
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-import mplfinance as mpf
-from flask import Flask
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    ChatPermissions,
-)
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    CallbackQueryHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
-)
+from PIL import Image, ImageDraw, ImageFont
 
+# Configuration
+
+BOT_TOKEN = “8588413389:AAFi-k5lYA3KE9vfE9nYyMd2TgPSPc34h3o”
+ADMIN_ID = 1801208219
+GROUP_CHAT_ID = -1003844211170
+HOT_WALLET = “UQABSEcWzJVmtLdZDUMyCs5EGrKOHWKWq3ftFNY0IItHgYTa”
+TON_API_KEY = “4c3e06303fb6a2b11dbc522c8ada5891eade8106197589b1478e2f35ef3814a2”
+PAYMENT_AMOUNT_USD = 0.99
+TICKET_EXPIRY_DAYS = 3
+PORT = int(os.environ.get(“PORT”, 10000))
+
+# Flask App
+
+app = Flask(**name**)
+
+# In-memory storage (lightweight for render.com)
+
+tickets_storage = {}  # {ticket_id: {media_data, created_at, title}}
+user_access = {}  # {user_id: {ticket_id: {paid, first_viewed_at, fingerprint}}}
+pending_payments = {}  # {payment_id: {ticket, user_id, amount, created_at}}
+ouo_link = “”  # Will be set via /link command
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(**name**)
+
+# TON Helper Functions
+
+def get_ton_price_usd():
+“”“Get current TON price in USD”””
 try:
-    import tweepy
-except ImportError:
-    tweepy = None
-
-# ════════════════════════════════════════════════════════════
-#  CONFIGURATION
-# ════════════════════════════════════════════════════════════
-
-BOT_TOKEN          = os.getenv("BOT_TOKEN", "")
-FREE_CHANNEL_ID    = int(os.getenv("FREE_CHANNEL_ID", "0"))
-PAID_CHANNEL_ID    = int(os.getenv("PAID_CHANNEL_ID", "0"))
-FREE_GROUP_ID      = int(os.getenv("FREE_GROUP_ID", "0"))
-ADMIN_IDS          = [int(x) for x in os.getenv("ADMIN_IDS", "0").split(",") if x.strip()]
-PAID_CHANNEL_LINK  = os.getenv("PAID_CHANNEL_LINK", "https://t.me/EarlySpikePremium")
-FREE_CHANNEL_LINK  = os.getenv("FREE_CHANNEL_LINK", "https://t.me/EarlySpike")
-
-TW_API_KEY         = os.getenv("TW_API_KEY", "")
-TW_API_SECRET      = os.getenv("TW_API_SECRET", "")
-TW_ACCESS_TOKEN    = os.getenv("TW_ACCESS_TOKEN", "")
-TW_ACCESS_SECRET   = os.getenv("TW_ACCESS_SECRET", "")
-TW_BEARER          = os.getenv("TW_BEARER", "")
-
-OKX_BASE           = "https://www.okx.com"
-
-MAX_FREE_DAILY     = 20
-MAX_TWEETS_DAILY   = 17
-SCAN_INTERVAL      = 60        # seconds between full scans
-MONITOR_INTERVAL   = 15        # seconds between TP/SL checks
-SIGNAL_COOLDOWN    = 60       # per-symbol cooldown (seconds)
-SIGNAL_EXPIRY_H    = 24        # close signal after N hours
-
-VOL_SPIKE_MULT     = 3.0       # volume must be Nx average
-MIN_PRICE_CHG      = 0.5       # minimum price change %
-RSI_LO, RSI_HI     = 35, 72   # RSI optimal zone
-MIN_SCORE           = 65       # minimum detection score
-
-DB_FILE            = "earlyspike.db"
-PORT               = int(os.getenv("PORT", "8080"))
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s ▸ %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)],
-)
-log = logging.getLogger("EarlySpike")
-
-# ════════════════════════════════════════════════════════════
-#  DATABASE  (SQLite + WAL — survives normal restarts)
-# ════════════════════════════════════════════════════════════
-
-class DB:
-    def __init__(self, path: str = DB_FILE):
-        self.path = path
-        self.lock = threading.Lock()
-        self._init()
-
-    # ── helpers ──────────────────────────────────────────────
-    def _conn(self):
-        c = sqlite3.connect(self.path, timeout=30)
-        c.row_factory = sqlite3.Row
-        c.execute("PRAGMA journal_mode=WAL")
-        c.execute("PRAGMA busy_timeout=5000")
-        return c
-
-    def _run(self, sql, p=()):
-        with self.lock:
-            c = self._conn()
-            try:
-                cur = c.execute(sql, p); c.commit(); return cur
-            finally:
-                c.close()
-
-    def _one(self, sql, p=()):
-        with self.lock:
-            c = self._conn()
-            try:
-                r = c.execute(sql, p).fetchone(); return dict(r) if r else None
-            finally:
-                c.close()
-
-    def _all(self, sql, p=()):
-        with self.lock:
-            c = self._conn()
-            try:
-                return [dict(r) for r in c.execute(sql, p).fetchall()]
-            finally:
-                c.close()
-
-    # ── schema ───────────────────────────────────────────────
-    def _init(self):
-        with self.lock:
-            c = self._conn()
-            try:
-                c.executescript("""
-                CREATE TABLE IF NOT EXISTS signals (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    symbol TEXT NOT NULL,
-                    mtype TEXT NOT NULL,
-                    entry REAL NOT NULL,
-                    tp1 REAL, tp2 REAL, tp3 REAL,
-                    sl REAL,
-                    volume REAL,
-                    roi_spot REAL, roi_5x REAL, roi_10x REAL, roi_20x REAL,
-                    status TEXT DEFAULT 'ACTIVE',
-                    tp1_hit INT DEFAULT 0, tp2_hit INT DEFAULT 0, tp3_hit INT DEFAULT 0,
-                    sl_hit INT DEFAULT 0,
-                    free_mid INT, paid_mid INT, tweet_id TEXT,
-                    created_at TEXT DEFAULT (datetime('now')),
-                    closed_at TEXT,
-                    pnl REAL
-                );
-                CREATE TABLE IF NOT EXISTS users (
-                    uid INTEGER PRIMARY KEY, uname TEXT, fname TEXT,
-                    joined TEXT DEFAULT (datetime('now'))
-                );
-                CREATE TABLE IF NOT EXISTS daily (
-                    day TEXT PRIMARY KEY,
-                    free_sig INT DEFAULT 0, tweets INT DEFAULT 0, total INT DEFAULT 0
-                );
-                CREATE TABLE IF NOT EXISTS pending (
-                    uid INTEGER PRIMARY KEY, cid INTEGER,
-                    ts TEXT DEFAULT (datetime('now'))
-                );
-                CREATE INDEX IF NOT EXISTS ix_sig_status ON signals(status);
-                CREATE INDEX IF NOT EXISTS ix_sig_sym    ON signals(symbol);
-                """)
-                c.commit()
-            finally:
-                c.close()
-
-    # ── signals ──────────────────────────────────────────────
-    def add_signal(self, d: dict) -> int:
-        cur = self._run(
-            """INSERT INTO signals
-               (symbol,mtype,entry,tp1,tp2,tp3,sl,volume,roi_spot,roi_5x,roi_10x,roi_20x)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (d["symbol"],d["mtype"],d["entry"],d["tp1"],d["tp2"],d["tp3"],d["sl"],
-             d.get("volume",0),d.get("roi_spot",0),d.get("roi_5x",0),
-             d.get("roi_10x",0),d.get("roi_20x",0)))
-        return cur.lastrowid
-
-    def set_msg_ids(self, sid, free=None, paid=None, tw=None):
-        parts, vals = [], []
-        if free is not None: parts.append("free_mid=?"); vals.append(free)
-        if paid is not None: parts.append("paid_mid=?"); vals.append(paid)
-        if tw   is not None: parts.append("tweet_id=?"); vals.append(tw)
-        if parts:
-            vals.append(sid)
-            self._run(f"UPDATE signals SET {','.join(parts)} WHERE id=?", tuple(vals))
-
-    def active_signals(self):
-        return self._all("SELECT * FROM signals WHERE status='ACTIVE'")
-
-    def hit_tp(self, sid, n):
-        self._run(f"UPDATE signals SET tp{n}_hit=1 WHERE id=?", (sid,))
-        s = self._one("SELECT * FROM signals WHERE id=?", (sid,))
-        if s and s["tp1_hit"] and s["tp2_hit"] and s["tp3_hit"]:
-            self._run("UPDATE signals SET status='ALL_TP', closed_at=datetime('now') WHERE id=?", (sid,))
-
-    def hit_sl(self, sid):
-        self._run("UPDATE signals SET sl_hit=1, status='SL_HIT', closed_at=datetime('now') WHERE id=?", (sid,))
-
-    def close_sig(self, sid, status, pnl=0):
-        self._run("UPDATE signals SET status=?, closed_at=datetime('now'), pnl=? WHERE id=?",
-                  (status, pnl, sid))
-
-    def get_sig(self, sid):
-        return self._one("SELECT * FROM signals WHERE id=?", (sid,))
-
-    # ── daily counters ───────────────────────────────────────
-    def _today(self):
-        return datetime.now(timezone.utc).strftime("%Y-%m-%d")
-
-    def today_counts(self):
-        d = self._today()
-        r = self._one("SELECT * FROM daily WHERE day=?", (d,))
-        if not r:
-            self._run("INSERT OR IGNORE INTO daily(day) VALUES(?)", (d,))
-            return {"day": d, "free_sig": 0, "tweets": 0, "total": 0}
-        return r
-
-    def inc(self, field):
-        d = self._today()
-        self._run(
-            f"INSERT INTO daily(day,{field}) VALUES(?,1) "
-            f"ON CONFLICT(day) DO UPDATE SET {field}={field}+1", (d,))
-
-    # ── users ────────────────────────────────────────────────
-    def add_user(self, uid, uname=None, fname=None):
-        self._run("INSERT OR IGNORE INTO users(uid,uname,fname) VALUES(?,?,?)",
-                  (uid, uname, fname))
-
-    # ── verification ─────────────────────────────────────────
-    def add_pending(self, uid, cid):
-        self._run("INSERT OR REPLACE INTO pending(uid,cid) VALUES(?,?)", (uid, cid))
-
-    def rm_pending(self, uid):
-        self._run("DELETE FROM pending WHERE uid=?", (uid,))
-
-    def expired_pending(self, mins=10):
-        return self._all(
-            "SELECT * FROM pending WHERE ts < datetime('now', ?)", (f"-{mins} minutes",))
-
-    # ── stats ────────────────────────────────────────────────
-    def stats(self):
-        t = self._one("SELECT COUNT(*) c FROM signals")["c"]
-        a = self._one("SELECT COUNT(*) c FROM signals WHERE status='ACTIVE'")["c"]
-        w = self._one("SELECT COUNT(*) c FROM signals WHERE status IN ('ALL_TP','PARTIAL_TP')")["c"]
-        l = self._one("SELECT COUNT(*) c FROM signals WHERE status='SL_HIT'")["c"]
-        u = self._one("SELECT COUNT(*) c FROM users")["c"]
-        wr = round(w / max(w + l, 1) * 100, 1)
-        return dict(total=t, active=a, wins=w, losses=l, users=u, winrate=wr)
-
-
-# ════════════════════════════════════════════════════════════
-#  OKX PUBLIC API CLIENT
-# ════════════════════════════════════════════════════════════
-
-class OKX:
-    def __init__(self):
-        self.s = requests.Session()
-        self.s.headers.update({"User-Agent": "EarlySpike/1.0"})
-        self._cache: Dict[str, Any] = {}
-        self._ctime: Dict[str, float] = {}
-        self.TTL = 25
-
-    def _get(self, ep, params=None):
-        key = f"{ep}|{json.dumps(params or {}, sort_keys=True)}"
-        now = time.time()
-        if key in self._cache and now - self._ctime.get(key, 0) < self.TTL:
-            return self._cache[key]
-        try:
-            r = self.s.get(f"{OKX_BASE}{ep}", params=params, timeout=15)
-            r.raise_for_status()
-            d = r.json()
-            if d.get("code") == "0":
-                self._cache[key] = d["data"]
-                self._ctime[key] = now
-                return d["data"]
-            return []
-        except Exception as e:
-            log.warning(f"OKX ▸ {e}")
-            return []
-
-    def tickers(self, inst_type="SPOT"):
-        return self._get("/api/v5/market/tickers", {"instType": inst_type})
-
-    def ticker(self, inst_id):
-        d = self._get("/api/v5/market/ticker", {"instId": inst_id})
-        return d[0] if d else None
-
-    def candles(self, inst_id, bar="5m", limit=100):
-        return self._get("/api/v5/market/candles",
-                         {"instId": inst_id, "bar": bar, "limit": str(limit)})
-
-    def clear(self):
-        self._cache.clear()
-        self._ctime.clear()
-
-
-# ════════════════════════════════════════════════════════════
-#  TECHNICAL ANALYSIS ENGINE
-# ════════════════════════════════════════════════════════════
-
-class TA:
-    @staticmethod
-    def ema(data, period):
-        out = np.empty_like(data)
-        m = 2.0 / (period + 1)
-        out[0] = data[0]
-        for i in range(1, len(data)):
-            out[i] = data[i] * m + out[i - 1] * (1 - m)
-        return out
-
-    @staticmethod
-    def rsi(closes, period=14):
-        d = np.diff(closes)
-        gain = np.where(d > 0, d, 0.0)
-        loss = np.where(d < 0, -d, 0.0)
-        ag = np.zeros(len(closes))
-        al = np.zeros(len(closes))
-        if len(gain) < period:
-            return np.full(len(closes), 50.0)
-        ag[period] = gain[:period].mean()
-        al[period] = loss[:period].mean()
-        for i in range(period + 1, len(closes)):
-            ag[i] = (ag[i - 1] * (period - 1) + gain[i - 1]) / period
-            al[i] = (al[i - 1] * (period - 1) + loss[i - 1]) / period
-        rs = np.where(al > 0, ag / al, 100.0)
-        return 100.0 - 100.0 / (1.0 + rs)
-
-    @staticmethod
-    def macd(closes):
-        e12 = TA.ema(closes, 12)
-        e26 = TA.ema(closes, 26)
-        line = e12 - e26
-        sig = TA.ema(line, 9)
-        return line, sig, line - sig  # macd, signal, histogram
-
-    @staticmethod
-    def bbands(closes, period=20, mult=2.0):
-        sma = np.convolve(closes, np.ones(period) / period, mode="valid")
-        sma = np.concatenate([np.full(period - 1, np.nan), sma])
-        std = np.array([
-            np.std(closes[max(0, i - period + 1):i + 1]) if i >= period - 1 else 0.0
-            for i in range(len(closes))
-        ])
-        return sma + mult * std, sma, sma - mult * std  # upper, mid, lower
-
-    @staticmethod
-    def atr(highs, lows, closes, period=14):
-        tr = np.maximum(
-            highs[1:] - lows[1:],
-            np.maximum(np.abs(highs[1:] - closes[:-1]),
-                       np.abs(lows[1:] - closes[:-1])))
-        out = np.zeros(len(closes))
-        if len(tr) >= period:
-            out[period] = tr[:period].mean()
-            for i in range(period + 1, len(closes)):
-                out[i] = (out[i - 1] * (period - 1) + tr[i - 1]) / period
-        return out
-
-    @staticmethod
-    def swing_levels(highs, lows, look=5):
-        res, sup = [], []
-        for i in range(look, len(highs) - look):
-            if highs[i] == highs[i - look:i + look + 1].max():
-                res.append(float(highs[i]))
-            if lows[i] == lows[i - look:i + look + 1].min():
-                sup.append(float(lows[i]))
-        return TA._dedup(sorted(sup)), TA._dedup(sorted(res))
-
-    @staticmethod
-    def _dedup(lvls, thr=0.005):
-        if not lvls:
-            return lvls
-        out = [lvls[0]]
-        for v in lvls[1:]:
-            if abs(v - out[-1]) / max(out[-1], 1e-12) > thr:
-                out.append(v)
-        return out
-
-    @staticmethod
-    def vol_spike(vols, period=20, mult=VOL_SPIKE_MULT):
-        if len(vols) < period + 1:
-            return False
-        avg = vols[-(period + 1):-1].mean()
-        return avg > 0 and vols[-1] > avg * mult
-
-    @staticmethod
-    def vol_increasing(vols, n=3):
-        if len(vols) < n + 1:
-            return False
-        recent = vols[-n:]
-        return all(recent[i] >= recent[i - 1] * 0.9 for i in range(1, len(recent)))
-
-    @staticmethod
-    def bullish_candles(opens, closes, n=5):
-        if len(opens) < n:
-            return 0
-        return int(sum(1 for i in range(-n, 0) if closes[i] > opens[i]))
-
-
-# ════════════════════════════════════════════════════════════
-#  SIGNAL DETECTOR
-# ════════════════════════════════════════════════════════════
-
-@dataclass
-class Signal:
-    symbol: str
-    mtype: str
-    entry: float
-    tp1: float
-    tp2: float
-    tp3: float
-    sl: float
-    volume: float
-    roi_spot: float
-    roi_5x: float
-    roi_10x: float
-    roi_20x: float
-    score: int = 0
-    candles_raw: list = None  # keep for chart
-
-    def to_dict(self):
-        return dict(symbol=self.symbol, mtype=self.mtype, entry=self.entry,
-                    tp1=self.tp1, tp2=self.tp2, tp3=self.tp3, sl=self.sl,
-                    volume=self.volume, roi_spot=self.roi_spot,
-                    roi_5x=self.roi_5x, roi_10x=self.roi_10x, roi_20x=self.roi_20x)
-
-
-class Detector:
-    def __init__(self, okx: OKX, db: DB):
-        self.okx = okx
-        self.db = db
-        self.cooldowns: Dict[str, float] = {}
-
-    def _cd(self, sym):
-        return time.time() - self.cooldowns.get(sym, 0) < SIGNAL_COOLDOWN
-
-    def _set_cd(self, sym):
-        self.cooldowns[sym] = time.time()
-
-    def _clean_cd(self):
-        now = time.time()
-        self.cooldowns = {k: v for k, v in self.cooldowns.items() if now - v < SIGNAL_COOLDOWN}
-
-    # ── main scan ────────────────────────────────────────────
-    def scan(self) -> List[Signal]:
-        out: List[Signal] = []
-        self._clean_cd()
-        for itype, label in [("SPOT", "SPOT"), ("SWAP", "FUTURES")]:
-            try:
-                tks = self.okx.tickers(itype)
-                if not tks:
-                    continue
-                cands = []
-                for t in tks:
-                    iid = t.get("instId", "")
-                    if "-USDT" not in iid:
-                        continue
-                    try:
-                        last = float(t.get("last", 0))
-                        v24 = float(t.get("volCcy24h", 0) or t.get("vol24h", 0))
-                        if last <= 0:
-                            continue
-                        vol_usd = v24 if v24 > 10000 else v24 * last
-                        minv = 50_000 if label == "SPOT" else 100_000
-                        if vol_usd < minv:
-                            continue
-                        op24 = float(t.get("open24h", 0) or t.get("sodUtc0", 0))
-                        chg = ((last - op24) / op24 * 100) if op24 > 0 else 0
-                        cands.append({"id": iid, "last": last, "vol": vol_usd, "chg": chg})
-                    except (ValueError, TypeError):
-                        continue
-                cands.sort(key=lambda x: x["vol"], reverse=True)
-                for c in cands[:150]:
-                    if self._cd(c["id"]):
-                        continue
-                    if self.db._one("SELECT 1 FROM signals WHERE symbol=? AND status='ACTIVE'",
-                                    (c["id"],)):
-                        continue
-                    sig = self._analyze(c["id"], label)
-                    if sig:
-                        out.append(sig)
-                        self._set_cd(c["id"])
-                    time.sleep(0.12)  # rate-limit courtesy
-            except Exception as e:
-                log.error(f"Scan {itype}: {e}")
-        out.sort(key=lambda s: s.score, reverse=True)
-        gc.collect()
-        return out
-
-    # ── deep analysis ────────────────────────────────────────
-    def _analyze(self, iid, mtype) -> Optional[Signal]:
-        try:
-            raw = self.okx.candles(iid, "5m", 100)
-            if not raw or len(raw) < 50:
-                return None
-            raw = list(reversed(raw))  # oldest first
-
-            o = np.array([float(c[1]) for c in raw])
-            h = np.array([float(c[2]) for c in raw])
-            l = np.array([float(c[3]) for c in raw])
-            cl = np.array([float(c[4]) for c in raw])
-            v = np.array([float(c[5]) for c in raw])
-
-            price = cl[-1]
-            if price <= 0:
-                return None
-
-            # ── scoring ──────────────────────────────────────
-            score = 0
-
-            # 1 ▸ volume spike  (max 35)
-            if TA.vol_spike(v, 20, 5.0):
-                score += 25
-            elif TA.vol_spike(v, 20, VOL_SPIKE_MULT):
-                score += 15
-            if TA.vol_increasing(v, 3):
-                score += 10
-
-            # 2 ▸ price action  (max 30)
-            ema20 = TA.ema(cl, 20)
-            if price > ema20[-1]:
-                score += 10
-            bull = TA.bullish_candles(o, cl, 5)
-            if bull >= 3:
-                score += 10
-            pchg = (price - cl[-6]) / cl[-6] * 100 if len(cl) >= 6 else 0
-            if pchg > 1.0:
-                score += 10
-            elif pchg > MIN_PRICE_CHG:
-                score += 5
-
-            # 3 ▸ momentum  (max 25)
-            rsi_arr = TA.rsi(cl)
-            rsi_now = float(rsi_arr[-1])
-            _, _, hist = TA.macd(cl)
-            if hist[-1] > 0:
-                score += 8
-            if len(hist) >= 2 and hist[-1] > hist[-2]:
-                score += 7
-            if RSI_LO < rsi_now < RSI_HI:
-                score += 10
-
-            # 4 ▸ Bollinger breakout  (max 10)
-            bb_up, _, _ = TA.bbands(cl)
-            if not np.isnan(bb_up[-1]) and price > bb_up[-1]:
-                score += 10
-            else:
-                atr_arr = TA.atr(h, l, cl)
-                if atr_arr[-1] > 0 and atr_arr[-1] > atr_arr[-2] * 1.2:
-                    score += 5
-
-            if score < MIN_SCORE:
-                return None
-
-            # ── TP / SL ─────────────────────────────────────
-            _atr = float(TA.atr(h, l, cl)[-1])
-            if _atr <= 0:
-                _atr = price * 0.01
-            sups, ress = TA.swing_levels(h, l, 5)
-            above = [r for r in ress if r > price * 1.005]
-
-            if len(above) >= 3:
-                tp1, tp2, tp3 = above[0], above[1], above[2]
-            elif len(above) == 2:
-                tp1, tp2 = above[0], above[1]
-                tp3 = price + _atr * 4
-            elif len(above) == 1:
-                tp1 = above[0]
-                tp2 = price + _atr * 2.5
-                tp3 = price + _atr * 4
-            else:
-                tp1 = price + _atr * 1.5
-                tp2 = price + _atr * 2.5
-                tp3 = price + _atr * 4.0
-
-            tp1 = max(tp1, price * 1.008)
-            tp2 = max(tp2, tp1 * 1.005)
-            tp3 = max(tp3, tp2 * 1.005)
-
-            below = [s for s in sups if s < price * 0.995]
-            if below:
-                sl = max(below[-1], price - _atr * 2)
-            else:
-                sl = price - _atr * 2
-            sl = max(sl, price * 0.90)
-            sl = min(sl, price * 0.90)
-
-            risk = price - sl
-            reward = tp1 - price
-            if risk <= 0 or reward / risk < 2.0:
-                return None
-
-            dec = self._dec(price)
-            tp1, tp2, tp3, sl = (round(x, dec) for x in (tp1, tp2, tp3, sl))
-            entry = round(price, dec)
-
-            rspot = round((tp3 - entry) / entry * 100, 2)
-
-            return Signal(
-                symbol=iid, mtype=mtype, entry=entry,
-                tp1=tp1, tp2=tp2, tp3=tp3, sl=sl,
-                volume=float(v[-1]) * price,
-                roi_spot=rspot, roi_5x=round(rspot * 5, 2),
-                roi_10x=round(rspot * 10, 2), roi_20x=round(rspot * 20, 2),
-                score=min(score, 100), candles_raw=raw,
-            )
-        except Exception as e:
-            log.debug(f"Analyze {iid}: {e}")
-            return None
-
-    @staticmethod
-    def _dec(p):
-        if p >= 1000: return 2
-        if p >= 1:    return 4
-        if p >= 0.01: return 6
-        return 8
-
-
-# ════════════════════════════════════════════════════════════
-#  CHART GENERATOR
-# ════════════════════════════════════════════════════════════
-
-C = {
-    "bg": "#0d1117", "txt": "#c9d1d9", "grid": "#21262d",
-    "up": "#00d984", "dn": "#ff4757", "tp": "#00d984",
-    "sl": "#ff4757", "en": "#ffa502", "wm": "#1c2a3a", "acc": "#58a6ff",
+response = requests.get(‘https://api.coingecko.com/api/v3/simple/price?ids=the-open-network&vs_currencies=usd’, timeout=10)
+if response.status_code == 200:
+data = response.json()
+return data.get(‘the-open-network’, {}).get(‘usd’, 5.0)  # Default fallback to $5
+except Exception as e:
+logger.error(f”Error fetching TON price: {e}”)
+return 5.0  # Fallback price
+
+def usd_to_ton(usd_amount):
+“”“Convert USD to TON”””
+ton_price = get_ton_price_usd()
+return usd_amount / ton_price
+
+def ton_to_nanoton(ton_amount):
+“”“Convert TON to nanoTON”””
+return int(ton_amount * 1_000_000_000)
+
+def verify_ton_transaction(tx_hash, expected_amount_nano, expected_destination):
+“”“Verify TON transaction using TON Center API”””
+try:
+headers = {
+‘X-API-Key’: TON_API_KEY
 }
 
-def _mpf_style():
-    mc = mpf.make_marketcolors(
-        up=C["up"], down=C["dn"],
-        edge={"up": C["up"], "down": C["dn"]},
-        wick={"up": C["up"], "down": C["dn"]},
-        volume={"up": C["up"], "down": C["dn"]},
-    )
-    return mpf.make_mpf_style(
-        marketcolors=mc, facecolor=C["bg"], edgecolor=C["grid"],
-        gridcolor=C["grid"], gridstyle="--", gridaxis="both", y_on_right=True,
-        rc={"font.size": 10, "axes.labelcolor": C["txt"],
-            "xtick.color": C["txt"], "ytick.color": C["txt"]},
-    )
+```
+    # Get transaction details from TON Center
+    url = f'https://toncenter.com/api/v2/getTransactions?address={expected_destination}&limit=50'
+    response = requests.get(url, headers=headers, timeout=15)
+    
+    if response.status_code == 200:
+        data = response.json()
+        transactions = data.get('result', [])
+        
+        for tx in transactions:
+            # Check transaction hash
+            tx_id = tx.get('transaction_id', {}).get('hash', '')
+            
+            # Check incoming messages
+            in_msg = tx.get('in_msg', {})
+            if in_msg:
+                value = int(in_msg.get('value', 0))
+                source = in_msg.get('source', '')
+                destination = in_msg.get('destination', '')
+                
+                # Verify transaction matches our criteria
+                if destination == expected_destination and value >= expected_amount_nano * 0.95:  # 5% tolerance
+                    return True, tx_id, value, source
+    
+    return False, None, 0, None
+    
+except Exception as e:
+    logger.error(f"Error verifying transaction: {e}")
+    return False, None, 0, None
+```
 
-def _watermark(fig):
-    fig.text(0.5, 0.5, "@EarlySpike", fontsize=44, color=C["wm"],
-             ha="center", va="center", alpha=0.35, fontweight="bold",
-             rotation=30, transform=fig.transFigure)
+def check_incoming_transactions(wallet_address, min_amount_nano, since_timestamp):
+“”“Check for incoming transactions to wallet since timestamp”””
+try:
+headers = {
+‘X-API-Key’: TON_API_KEY
+}
 
-def chart_signal(candles_raw, sig: Signal) -> BytesIO:
-    try:
-        data = []
-        for c_ in candles_raw[-65:]:
-            ts = datetime.fromtimestamp(int(c_[0]) / 1000, tz=timezone.utc)
-            data.append({"Date": ts, "Open": float(c_[1]), "High": float(c_[2]),
-                         "Low": float(c_[3]), "Close": float(c_[4]),
-                         "Volume": float(c_[5])})
-        df = pd.DataFrame(data).set_index("Date")
-
-        hlines = dict(
-            hlines=[sig.tp1, sig.tp2, sig.tp3, sig.sl, sig.entry],
-            colors=[C["tp"], C["tp"], C["tp"], C["sl"], C["en"]],
-            linewidths=[1, 1, 1, 1.5, 1.5],
-            linestyle=["--", "--", "--", "-", "-"],
-            alpha=0.75,
-        )
-        fig, axes = mpf.plot(
-            df, type="candle", style=_mpf_style(), volume=True,
-            hlines=hlines, figsize=(12, 7), returnfig=True,
-            tight_layout=True, panel_ratios=(4, 1),
-        )
-        ax = axes[0]
-        n = len(df) - 1
-        for lbl, val, col in [("TP3", sig.tp3, C["tp"]), ("TP2", sig.tp2, C["tp"]),
-                               ("TP1", sig.tp1, C["tp"]), ("ENTRY", sig.entry, C["en"]),
-                               ("SL", sig.sl, C["sl"])]:
-            ax.annotate(f"  {lbl} {val}", xy=(n, val), fontsize=8,
-                        color=col, fontweight="bold", va="center")
-        sym = sig.symbol.replace("-", "/")
-        ax.set_title(f"  {sym}  ┃  {sig.mtype}", fontsize=14,
-                     fontweight="bold", color=C["acc"], loc="left", pad=10)
-        _watermark(fig)
-        buf = BytesIO()
-        fig.savefig(buf, format="png", dpi=150, facecolor=C["bg"],
-                    bbox_inches="tight", pad_inches=0.3)
-        plt.close(fig)
-        buf.seek(0)
-        return buf
-    except Exception as e:
-        log.error(f"Chart err: {e}")
-        return _chart_fallback(sig)
-
-def _chart_fallback(sig):
-    fig, ax = plt.subplots(figsize=(12, 7), facecolor=C["bg"])
-    ax.set_facecolor(C["bg"])
-    for lbl, val, col in [("TP3", sig.tp3, C["tp"]), ("TP2", sig.tp2, C["tp"]),
-                           ("TP1", sig.tp1, C["tp"]), ("ENTRY", sig.entry, C["en"]),
-                           ("SL", sig.sl, C["sl"])]:
-        ax.axhline(val, color=col, ls="--", lw=1.5, alpha=0.8)
-        ax.text(0.02, val, f"  {lbl}: {val}", transform=ax.get_yaxis_transform(),
-                fontsize=11, color=col, fontweight="bold", va="center")
-    ax.set_ylim(sig.sl * 0.995, sig.tp3 * 1.005)
-    ax.set_title(f"{sig.symbol.replace('-','/')} | {sig.mtype}",
-                 fontsize=16, fontweight="bold", color=C["acc"])
-    ax.tick_params(colors=C["txt"])
-    _watermark(fig)
-    buf = BytesIO()
-    fig.savefig(buf, format="png", dpi=150, facecolor=C["bg"], bbox_inches="tight")
-    plt.close(fig)
-    buf.seek(0)
-    return buf
-
-def chart_report(candles_raw, sd, results) -> BytesIO:
-    try:
-        if not candles_raw or len(candles_raw) < 10:
-            return _report_fallback(sd, results)
-        raw = list(candles_raw)
-        if int(raw[0][0]) > int(raw[-1][0]):
-            raw.reverse()
-        data = []
-        for c_ in raw[-80:]:
-            ts = datetime.fromtimestamp(int(c_[0]) / 1000, tz=timezone.utc)
-            data.append({"Date": ts, "Open": float(c_[1]), "High": float(c_[2]),
-                         "Low": float(c_[3]), "Close": float(c_[4]),
-                         "Volume": float(c_[5])})
-        df = pd.DataFrame(data).set_index("Date")
-
-        lvls, cols = [], []
-        for n_ in (1, 2, 3):
-            lvls.append(sd[f"tp{n_}"])
-            cols.append("#00d984" if results.get(f"tp{n_}_hit") else "#555")
-        lvls.append(sd["sl"])
-        cols.append("#ff4757" if results.get("sl_hit") else "#555")
-        lvls.append(sd["entry"])
-        cols.append(C["en"])
-
-        hlines = dict(hlines=lvls, colors=cols,
-                      linewidths=[1.5]*len(lvls), linestyle=["--"]*len(lvls), alpha=0.8)
-        fig, axes = mpf.plot(df, type="candle", style=_mpf_style(), volume=True,
-                             hlines=hlines, figsize=(12, 7), returnfig=True,
-                             tight_layout=True, panel_ratios=(4, 1))
-        ax = axes[0]
-        is_win = results.get("tp1_hit", False)
-        tag = "✅ WIN" if is_win else "❌ LOSS"
-        tcol = C["up"] if is_win else C["dn"]
-        sym = sd["symbol"].replace("-", "/")
-        ax.set_title(f"  {sym}  ┃  REPORT  ┃  {tag}", fontsize=14,
-                     fontweight="bold", color=tcol, loc="left", pad=10)
-        _watermark(fig)
-        buf = BytesIO()
-        fig.savefig(buf, format="png", dpi=150, facecolor=C["bg"],
-                    bbox_inches="tight", pad_inches=0.3)
-        plt.close(fig)
-        buf.seek(0)
-        return buf
-    except Exception as e:
-        log.error(f"Report chart err: {e}")
-        return _report_fallback(sd, results)
-
-def _report_fallback(sd, results):
-    fig, ax = plt.subplots(figsize=(12, 7), facecolor=C["bg"])
-    ax.set_facecolor(C["bg"])
-    w = results.get("tp1_hit", False)
-    ax.text(0.5, 0.5, f"{'✅ WIN' if w else '❌ LOSS'}\n{sd['symbol'].replace('-','/')}",
-            fontsize=30, ha="center", va="center",
-            color=C["up"] if w else C["dn"], fontweight="bold", transform=ax.transAxes)
-    _watermark(fig)
-    ax.axis("off")
-    buf = BytesIO()
-    fig.savefig(buf, format="png", dpi=150, facecolor=C["bg"], bbox_inches="tight")
-    plt.close(fig)
-    buf.seek(0)
-    return buf
-
-
-# ════════════════════════════════════════════════════════════
-#  TWITTER CLIENT
-# ════════════════════════════════════════════════════════════
-
-class Twitter:
-    def __init__(self, db: DB):
-        self.db = db
-        self.ok = False
-        self.client = None
-        self.api1 = None
-        if tweepy and TW_API_KEY and TW_ACCESS_TOKEN:
-            try:
-                self.client = tweepy.Client(
-                    bearer_token=TW_BEARER, consumer_key=TW_API_KEY,
-                    consumer_secret=TW_API_SECRET,
-                    access_token=TW_ACCESS_TOKEN,
-                    access_token_secret=TW_ACCESS_SECRET)
-                auth = tweepy.OAuth1UserHandler(
-                    TW_API_KEY, TW_API_SECRET, TW_ACCESS_TOKEN, TW_ACCESS_SECRET)
-                self.api1 = tweepy.API(auth)
-                self.ok = True
-                log.info("✅ Twitter ready")
-            except Exception as e:
-                log.warning(f"Twitter init: {e}")
-
-    def can_post(self):
-        return self.ok and self.db.today_counts()["tweets"] < MAX_TWEETS_DAILY
-
-    def post(self, sig: Signal, chart_buf: BytesIO = None) -> Optional[str]:
-        if not self.can_post():
-            return None
-        try:
-            sym = sig.symbol.replace("-", "/")
-            tag = sig.symbol.replace("-", "").replace("/", "")
-            txt = (
-                f"🚀 #{tag} Signal\n\n"
-                f"📊 {sym} | {sig.mtype}\n"
-                f"💰 Entry: {sig.entry}\n\n"
-                f"🎯 TP1: {sig.tp1}\n"
-                f"🎯 TP2: {sig.tp2}\n"
-                f"🎯 TP3: {sig.tp3}\n"
-                f"🛑 SL: {sig.sl}\n\n"
-                f"📈 ROI: {sig.roi_spot}% Spot | {sig.roi_5x}% 5x | {sig.roi_10x}% 10x\n\n"
-                f"⚡ FREE signals ➜ {FREE_CHANNEL_LINK}\n\n"
-                f"#Crypto #Trading #EarlySpike"
-            )
-            mid = None
-            if chart_buf and self.api1:
-                chart_buf.seek(0)
-                media = self.api1.media_upload(filename="signal.png", file=chart_buf)
-                mid = media.media_id
-            resp = self.client.create_tweet(text=txt, media_ids=[mid] if mid else None)
-            tid = str(resp.data["id"])
-            self.db.inc("tweets")
-            log.info(f"🐦 Tweet {tid}")
-            return tid
-        except Exception as e:
-            log.error(f"Tweet err: {e}")
-            return None
-
-
-# ════════════════════════════════════════════════════════════
-#  VOLUME / NUMBER FORMATTING UTILS
-# ════════════════════════════════════════════════════════════
-
-def fmt_vol(v):
-    if v >= 1e9:  return f"${v/1e9:.2f}B"
-    if v >= 1e6:  return f"${v/1e6:.2f}M"
-    if v >= 1e3:  return f"${v/1e3:.1f}K"
-    return f"${v:.0f}"
-
-
-# ════════════════════════════════════════════════════════════
-#  TELEGRAM BOT — Handlers & Senders
-# ════════════════════════════════════════════════════════════
-
-class Bot:
-    def __init__(self, db: DB, okx: OKX, det: Detector, tw: Twitter):
-        self.db = db
-        self.okx = okx
-        self.det = det
-        self.tw = tw
-        self.app: Optional[Application] = None
-
-    def build(self) -> Application:
-        self.app = Application.builder().token(BOT_TOKEN).build()
-        a = self.app
-        a.add_handler(CommandHandler("start", self.h_start))
-        a.add_handler(CommandHandler("stats", self.h_stats))
-        a.add_handler(CommandHandler("promote", self.h_promote))
-        a.add_handler(CommandHandler("cancel", self.h_cancel))
-        a.add_handler(CommandHandler("help", self.h_help))
-        a.add_handler(CallbackQueryHandler(self.h_cb))
-        a.add_handler(MessageHandler(
-            filters.StatusUpdate.NEW_CHAT_MEMBERS, self.h_newmember))
-        # catch-all for promote flow (group=1 so it doesn't block other handlers)
-        a.add_handler(MessageHandler(
-            filters.ALL & ~filters.COMMAND, self.h_msg), group=1)
-        return a
-
-    # ── /start ───────────────────────────────────────────────
-    async def h_start(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-        u = update.effective_user
-        self.db.add_user(u.id, u.username, u.first_name)
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📢  Free Channel", url=FREE_CHANNEL_LINK)],
-            [InlineKeyboardButton("👑  Premium 24/7", url=PAID_CHANNEL_LINK)],
-        ])
-        await update.message.reply_text(
-            "⚡ <b>Welcome to EarlySpike!</b> ⚡\n\n"
-            "The most <b>advanced crypto signal sniper</b> you'll ever use.\n\n"
-            "🔍 We detect coins <b>minutes before they explode</b> using\n"
-            "real-time volume analysis, multi-indicator momentum scoring,\n"
-            "and smart TP/SL placement based on liquidity zones.\n\n"
-            "📊 <b>Every signal includes:</b>\n"
-            "• Beautiful chart with entry, 3 TPs & SL\n"
-            "• ROI for Spot, 5x, 10x, 20x leverage\n"
-            "• Live performance report once targets are hit\n\n"
-            "💎 <b>Free Channel</b> — up to 20 signals/day\n"
-            "👑 <b>Premium</b> — unlimited signals 24/7\n\n"
-            "🚀 <i>Join now and never miss the next big move!</i>",
-            parse_mode="HTML", reply_markup=kb)
-
-    # ── /stats ───────────────────────────────────────────────
-    async def h_stats(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-        if update.effective_user.id not in ADMIN_IDS:
-            return await update.message.reply_text("⛔")
-        s = self.db.stats()
-        t = self.db.today_counts()
-        await update.message.reply_text(
-            "📊 <b>EarlySpike Stats</b>\n"
-            "━━━━━━━━━━━━━━━━━━\n"
-            f"📈 Total: <b>{s['total']}</b>  ┃  🟢 Active: <b>{s['active']}</b>\n"
-            f"✅ Wins: <b>{s['wins']}</b>  ┃  ❌ Losses: <b>{s['losses']}</b>\n"
-            f"🎯 Win Rate: <b>{s['winrate']}%</b>\n"
-            f"👥 Users: <b>{s['users']}</b>\n\n"
-            f"📅 <b>Today</b>\n"
-            f"📢 Free: {t['free_sig']}/{MAX_FREE_DAILY}  ┃  "
-            f"🐦 Tweets: {t['tweets']}/{MAX_TWEETS_DAILY}  ┃  "
-            f"📊 Total: {t['total']}",
-            parse_mode="HTML")
-
-    # ── /promote ─────────────────────────────────────────────
-    async def h_promote(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-        if update.effective_user.id not in ADMIN_IDS:
-            return await update.message.reply_text("⛔")
-        ctx.user_data["promo"] = {"step": "content"}
-        await update.message.reply_text(
-            "📣 <b>Promote Mode</b>\n\n"
-            "Send your content now (text / photo / video / GIF).\n"
-            "Use /cancel to abort.", parse_mode="HTML")
-
-    async def h_cancel(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-        ctx.user_data.pop("promo", None)
-        await update.message.reply_text("❌ Cancelled.")
-
-    # ── /help ────────────────────────────────────────────────
-    async def h_help(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text(
-            "⚡ <b>EarlySpike Commands</b>\n\n"
-            "/start — Welcome\n/stats — Statistics (admin)\n"
-            "/promote — Send promo (admin)\n/help — This message",
-            parse_mode="HTML")
-
-    # ── callback queries ─────────────────────────────────────
-    async def h_cb(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-        q = update.callback_query
-        await q.answer()
-        if q.data == "verify":
-            uid = q.from_user.id
-            self.db.rm_pending(uid)
-            try:
-                await ctx.bot.restrict_chat_member(
-                    FREE_GROUP_ID, uid,
-                    permissions=ChatPermissions(
-                        can_send_messages=True, can_send_audios=True,
-                        can_send_documents=True, can_send_photos=True,
-                        can_send_videos=True, can_send_video_notes=True,
-                        can_send_voice_notes=True, can_send_polls=True,
-                        can_send_other_messages=True,
-                        can_add_web_page_previews=True,
-                        can_invite_users=True))
-            except Exception as e:
-                log.error(f"Unrestrict: {e}")
-            await q.edit_message_text("✅ <b>Verified!</b> Welcome to EarlySpike 🚀",
-                                      parse_mode="HTML")
-
-    # ── new member verification ──────────────────────────────
-    async def h_newmember(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-        if not update.message or not update.message.new_chat_members:
-            return
-        cid = update.effective_chat.id
-        if cid != FREE_GROUP_ID:
-            return
-        for m in update.message.new_chat_members:
-            if m.is_bot:
+```
+    url = f'https://toncenter.com/api/v2/getTransactions?address={wallet_address}&limit=100'
+    response = requests.get(url, headers=headers, timeout=15)
+    
+    if response.status_code == 200:
+        data = response.json()
+        transactions = data.get('result', [])
+        
+        valid_transactions = []
+        
+        for tx in transactions:
+            tx_time = tx.get('utime', 0)
+            
+            # Only check transactions after our timestamp
+            if tx_time < since_timestamp:
                 continue
-            self.db.add_pending(m.id, cid)
-            try:
-                await ctx.bot.restrict_chat_member(
-                    cid, m.id,
-                    permissions=ChatPermissions(
-                        can_send_messages=False, can_send_audios=False,
-                        can_send_documents=False, can_send_photos=False,
-                        can_send_videos=False, can_send_video_notes=False,
-                        can_send_voice_notes=False, can_send_polls=False,
-                        can_send_other_messages=False,
-                        can_add_web_page_previews=False))
-            except Exception as e:
-                log.error(f"Restrict: {e}")
-            kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("✅ Verify you're not a robot", callback_data="verify")]
-            ])
-            await update.message.reply_text(
-                f"👋 Hey <b>{m.first_name}</b>!\n\n"
-                f"🔒 Tap the button below to verify.\n"
-                f"⏰ You have <b>10 minutes</b> or you'll be removed.",
-                parse_mode="HTML", reply_markup=kb)
+            
+            in_msg = tx.get('in_msg', {})
+            if in_msg:
+                value = int(in_msg.get('value', 0))
+                source = in_msg.get('source', '')
+                
+                if value >= min_amount_nano * 0.95:  # 5% tolerance
+                    valid_transactions.append({
+                        'hash': tx.get('transaction_id', {}).get('hash', ''),
+                        'value': value,
+                        'source': source,
+                        'time': tx_time,
+                        'comment': in_msg.get('message', '')
+                    })
+        
+        return valid_transactions
+    
+    return []
+    
+except Exception as e:
+    logger.error(f"Error checking transactions: {e}")
+    return []
+```
 
-    # ── promote flow message handler ─────────────────────────
-    async def h_msg(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-        promo = ctx.user_data.get("promo")
-        if not promo or update.effective_user.id not in ADMIN_IDS:
-            return
-        msg = update.message
-        if not msg:
-            return
-        step = promo.get("step")
+# HTML Template for Mini App with TON Connect
 
-        if step == "content":
-            promo["content"] = msg
-            promo["step"] = "btn_text"
-            await msg.reply_text(
-                "✅ Content saved!\n\nSend <b>button text</b> or /skip for no button.",
-                parse_mode="HTML")
+MINI_APP_HTML = “””
 
-        elif step == "btn_text":
-            if msg.text and msg.text.strip() == "/skip":
-                promo["btn_text"] = None
-                promo["step"] = "target"
-                await msg.reply_text("Now send the <b>target chat ID</b>.", parse_mode="HTML")
-            else:
-                promo["btn_text"] = msg.text
-                promo["step"] = "btn_url"
-                await msg.reply_text("Send the <b>button URL</b> or <b>chat ID</b>.",
-                                     parse_mode="HTML")
+<!DOCTYPE html>
 
-        elif step == "btn_url":
-            url = msg.text.strip()
-            if not url.startswith("http"):
-                url = f"https://t.me/{url.lstrip('@')}"
-            promo["btn_url"] = url
-            promo["step"] = "target"
-            await msg.reply_text("Send the <b>target chat ID</b>.", parse_mode="HTML")
+<html lang="ar" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-select=none">
+    <title>G🅾️reSignal</title>
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+    <script src="https://unpkg.com/@tonconnect/ui@latest/dist/tonconnect-ui.min.js"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+            -webkit-user-select: none;
+            -moz-user-select: none;
+            -ms-user-select: none;
+            user-select: none;
+        }
 
-        elif step == "target":
-            target = msg.text.strip()
-            content: Any = promo["content"]
-            kb = None
-            if promo.get("btn_text") and promo.get("btn_url"):
-                kb = InlineKeyboardMarkup([
-                    [InlineKeyboardButton(promo["btn_text"], url=promo["btn_url"])]
-                ])
-            try:
-                tid = int(target)
-                if content.photo:
-                    await ctx.bot.send_photo(tid, content.photo[-1].file_id,
-                                             caption=content.caption or "",
-                                             parse_mode="HTML", reply_markup=kb)
-                elif content.video:
-                    await ctx.bot.send_video(tid, content.video.file_id,
-                                             caption=content.caption or "",
-                                             parse_mode="HTML", reply_markup=kb)
-                elif content.animation:
-                    await ctx.bot.send_animation(tid, content.animation.file_id,
-                                                 caption=content.caption or "",
-                                                 parse_mode="HTML", reply_markup=kb)
-                elif content.document:
-                    await ctx.bot.send_document(tid, content.document.file_id,
-                                                caption=content.caption or "",
-                                                parse_mode="HTML", reply_markup=kb)
-                else:
-                    await ctx.bot.send_message(tid, content.text or "",
-                                               parse_mode="HTML", reply_markup=kb)
-                await msg.reply_text(f"✅ Sent to <code>{target}</code>!", parse_mode="HTML")
-            except Exception as e:
-                await msg.reply_text(f"❌ Error: <code>{e}</code>", parse_mode="HTML")
-            ctx.user_data.pop("promo", None)
+```
+    body {
+        font-family: 'Arial', sans-serif;
+        background: linear-gradient(135deg, #1a1a1a 0%, #2d2d2d 100%);
+        color: #fff;
+        min-height: 100vh;
+        padding: 20px;
+        overflow-x: hidden;
+    }
+    
+    .logo {
+        text-align: center;
+        margin-bottom: 30px;
+    }
+    
+    .logo img {
+        width: 80px;
+        height: 80px;
+        border-radius: 50%;
+        border: 3px solid #ff4444;
+        pointer-events: none;
+    }
+    
+    .logo h1 {
+        margin-top: 10px;
+        font-size: 28px;
+        color: #ff4444;
+    }
+    
+    .container {
+        max-width: 600px;
+        margin: 0 auto;
+    }
+    
+    .search-box {
+        background: rgba(255,255,255,0.1);
+        border-radius: 15px;
+        padding: 20px;
+        margin-bottom: 20px;
+        backdrop-filter: blur(10px);
+    }
+    
+    .search-box input {
+        width: 100%;
+        padding: 15px;
+        border: 2px solid #ff4444;
+        border-radius: 10px;
+        background: rgba(0,0,0,0.5);
+        color: #fff;
+        font-size: 16px;
+        font-family: monospace;
+        text-align: center;
+    }
+    
+    .search-box button {
+        width: 100%;
+        padding: 15px;
+        margin-top: 10px;
+        border: none;
+        border-radius: 10px;
+        background: #ff4444;
+        color: #fff;
+        font-size: 18px;
+        font-weight: bold;
+        cursor: pointer;
+        transition: 0.3s;
+    }
+    
+    .search-box button:active {
+        transform: scale(0.95);
+        background: #cc0000;
+    }
+    
+    .content-viewer {
+        display: none;
+        background: rgba(255,255,255,0.1);
+        border-radius: 15px;
+        padding: 20px;
+        backdrop-filter: blur(10px);
+    }
+    
+    .content-viewer.active {
+        display: block;
+    }
+    
+    .media-container {
+        position: relative;
+        width: 100%;
+        max-width: 100%;
+        border-radius: 10px;
+        overflow: hidden;
+        background: #000;
+        pointer-events: none;
+    }
+    
+    .media-container video,
+    .media-container img {
+        width: 100%;
+        height: auto;
+        display: block;
+        pointer-events: none;
+    }
+    
+    .timer-overlay {
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        background: rgba(255,68,68,0.9);
+        color: #fff;
+        padding: 15px;
+        text-align: center;
+        font-size: 18px;
+        font-weight: bold;
+        z-index: 1000;
+    }
+    
+    .payment-modal {
+        display: none;
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        background: rgba(0,0,0,0.95);
+        z-index: 2000;
+        padding: 20px;
+        align-items: center;
+        justify-content: center;
+    }
+    
+    .payment-modal.active {
+        display: flex;
+    }
+    
+    .payment-content {
+        background: linear-gradient(135deg, #2d2d2d 0%, #1a1a1a 100%);
+        border-radius: 20px;
+        padding: 30px;
+        max-width: 400px;
+        width: 100%;
+        text-align: center;
+        border: 2px solid #ff4444;
+    }
+    
+    .payment-content h2 {
+        color: #ff4444;
+        margin-bottom: 20px;
+    }
+    
+    .payment-content .price {
+        font-size: 32px;
+        color: #0098ea;
+        margin: 20px 0;
+        font-weight: bold;
+    }
+    
+    .payment-content .ton-connect-button {
+        width: 100%;
+        padding: 15px;
+        margin-top: 15px;
+        border: none;
+        border-radius: 10px;
+        background: #0098ea;
+        color: #fff;
+        font-size: 16px;
+        font-weight: bold;
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 10px;
+    }
+    
+    .payment-content button {
+        width: 100%;
+        padding: 15px;
+        margin-top: 15px;
+        border: none;
+        border-radius: 10px;
+        background: #ff4444;
+        color: #fff;
+        font-size: 16px;
+        font-weight: bold;
+        cursor: pointer;
+    }
+    
+    .payment-content .alternative-payment {
+        margin-top: 20px;
+        padding-top: 20px;
+        border-top: 1px solid rgba(255,255,255,0.2);
+    }
+    
+    .payment-content .wallet-address {
+        background: rgba(0,0,0,0.5);
+        padding: 10px;
+        border-radius: 8px;
+        font-family: monospace;
+        font-size: 12px;
+        word-break: break-all;
+        margin: 10px 0;
+        cursor: pointer;
+    }
+    
+    .payment-content .copy-button {
+        background: #444;
+        padding: 8px 15px;
+        border-radius: 5px;
+        font-size: 14px;
+        margin-top: 10px;
+    }
+    
+    .error-message {
+        background: rgba(255,68,68,0.2);
+        border: 2px solid #ff4444;
+        border-radius: 10px;
+        padding: 15px;
+        margin-top: 10px;
+        text-align: center;
+    }
+    
+    .success-message {
+        background: rgba(68,255,68,0.2);
+        border: 2px solid #44ff44;
+        border-radius: 10px;
+        padding: 15px;
+        margin-top: 10px;
+        text-align: center;
+        color: #44ff44;
+    }
+    
+    .watermark-overlay {
+        position: absolute;
+        top: 0;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        pointer-events: none;
+        z-index: 100;
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        grid-template-rows: repeat(3, 1fr);
+        opacity: 0.3;
+    }
+    
+    .watermark-overlay span {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        color: #fff;
+        font-weight: bold;
+        font-size: 14px;
+        text-shadow: 2px 2px 4px rgba(0,0,0,0.8);
+    }
+    
+    .loading {
+        display: inline-block;
+        width: 20px;
+        height: 20px;
+        border: 3px solid rgba(255,255,255,.3);
+        border-radius: 50%;
+        border-top-color: #fff;
+        animation: spin 1s ease-in-out infinite;
+    }
+    
+    @keyframes spin {
+        to { transform: rotate(360deg); }
+    }
+    
+    .payment-status {
+        margin-top: 15px;
+        padding: 10px;
+        border-radius: 8px;
+        background: rgba(0,152,234,0.2);
+        border: 1px solid #0098ea;
+    }
+</style>
+```
 
-    # ═══════════════ SIGNAL SENDERS ══════════════════════════
+</head>
+<body>
+    <div class="logo">
+        <img src="data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iODAiIGhlaWdodD0iODAiIHZpZXdCb3g9IjAgMCA4MCA4MCIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPGNpcmNsZSBjeD0iNDAiIGN5PSI0MCIgcj0iMzgiIHN0cm9rZT0iI2ZmNDQ0NCIgc3Ryb2tlLXdpZHRoPSI0Ii8+CjxwYXRoIGQ9Ik0zMCAyNUw0NSAyNUw1MCAzNUw0NSA0NUw1MCA1NUwzNSA1NUwzMCA0NUwzNSAzNUwzMCAyNVoiIGZpbGw9IiNmZjQ0NDQiLz4KPC9zdmc+Cg==" alt="Logo">
+        <h1>G🅾️reSignal</h1>
+    </div>
 
-    async def send_signal(self, sig: Signal, chart_buf: BytesIO):
-        sym = sig.symbol.replace("-", "/")
-        vol = fmt_vol(sig.volume)
-        txt = (
-            f"⚡ <b>EARLYSPIKE SIGNAL</b> ⚡\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"📊  <b>{sym}</b>\n"
-            f"📈  {sig.mtype}\n"
-            f"💰  Vol: <b>{vol}</b>\n\n"
-            f"🟢  Entry: <code>{sig.entry}</code>\n\n"
-            f"🎯  TP1:  <code>{sig.tp1}</code>\n"
-            f"🎯  TP2:  <code>{sig.tp2}</code>\n"
-            f"🎯  TP3:  <code>{sig.tp3}</code>\n"
-            f"🛑  SL:    <code>{sig.sl}</code>\n\n"
-            f"💵  ROI  <b>{sig.roi_spot}%</b>  ┃  SPOT\n"
-            f"💵  ROI  <b>{sig.roi_5x}%</b>  ┃  5x Leverage\n"
-            f"💵  ROI  <b>{sig.roi_10x}%</b>  ┃  10x Leverage\n"
-            f"💵  ROI  <b>{sig.roi_20x}%</b>  ┃  20x Leverage\n\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"⚡ @EarlySpike"
-        )
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("👑 Premium Signals 24/7", url=PAID_CHANNEL_LINK)]
-        ])
+```
+<div class="container">
+    <div class="search-box" id="searchBox">
+        <input type="text" id="ticketInput" placeholder="أدخل التيكت هنا" maxlength="8">
+        <button onclick="searchTicket()">🔍 بحث</button>
+        <div id="message"></div>
+    </div>
+    
+    <div class="content-viewer" id="contentViewer">
+        <h2 id="contentTitle" style="margin-bottom: 15px; text-align: center;"></h2>
+        <div class="media-container" id="mediaContainer">
+            <div class="watermark-overlay">
+                <span>@GoreSignal</span>
+                <span>@GoreSignal</span>
+                <span>@GoreSignal</span>
+                <span>@GoreSignal</span>
+                <span>@GoreSignal</span>
+                <span>@GoreSignal</span>
+                <span>@GoreSignal</span>
+                <span>@GoreSignal</span>
+                <span>@GoreSignal</span>
+            </div>
+        </div>
+    </div>
+</div>
 
-        sid = self.db.add_signal(sig.to_dict())
-        free_mid = paid_mid = tw_id = None
+<div class="timer-overlay" id="timerOverlay" style="display: none;">
+    ⏱️ الوقت المتبقي: <span id="timerText">00:00</span>
+</div>
 
-        # → paid channel (always)
-        try:
-            chart_buf.seek(0)
-            m = await self.app.bot.send_photo(
-                PAID_CHANNEL_ID, chart_buf, caption=txt, parse_mode="HTML")
-            paid_mid = m.message_id
-            self.db.inc("total")
-        except Exception as e:
-            log.error(f"Paid send: {e}")
+<div class="payment-modal" id="paymentModal">
+    <div class="payment-content">
+        <h2>💎 فتح محتوى غير محدود</h2>
+        <p>صلاحية 3 أيام كاملة</p>
+        <div class="price" id="tonPrice">⏳ جاري الحساب...</div>
+        
+        <div id="tonConnectContainer"></div>
+        
+        <div class="alternative-payment">
+            <p style="font-size: 14px; color: #aaa;">أو أرسل يدوياً إلى:</p>
+            <div class="wallet-address" id="walletAddress" onclick="copyWallet()">
+                UQABSEcWzJVmtLdZDUMyCs5EGrKOHWKWq3ftFNY0IItHgYTa
+            </div>
+            <button class="copy-button" onclick="copyWallet()">📋 نسخ العنوان</button>
+            
+            <div class="payment-status" id="paymentStatus" style="display: none;">
+                <div class="loading"></div>
+                <p style="margin-top: 10px;">جاري التحقق من الدفع...</p>
+            </div>
+        </div>
+        
+        <button onclick="closePaymentModal()" style="background: #666; margin-top: 20px;">إلغاء</button>
+    </div>
+</div>
 
-        # → free channel (daily limit)
-        cnt = self.db.today_counts()
-        if cnt["free_sig"] < MAX_FREE_DAILY:
-            try:
-                chart_buf.seek(0)
-                m = await self.app.bot.send_photo(
-                    FREE_CHANNEL_ID, chart_buf, caption=txt,
-                    parse_mode="HTML", reply_markup=kb)
-                free_mid = m.message_id
-                self.db.inc("free_sig")
-            except Exception as e:
-                log.error(f"Free send: {e}")
+<script>
+    let tg = window.Telegram.WebApp;
+    tg.expand();
+    tg.disableVerticalSwipes();
+    
+    let currentTicket = '';
+    let timerInterval = null;
+    let paymentCheckInterval = null;
+    let userFingerprint = '';
+    let currentPaymentId = '';
+    let tonConnectUI = null;
+    let requiredTonAmount = 0;
+    
+    // Initialize TON Connect
+    try {
+        tonConnectUI = new TON_CONNECT_UI.TonConnectUI({
+            manifestUrl: window.location.origin + '/tonconnect-manifest.json',
+            buttonRootId: 'tonConnectContainer'
+        });
+    } catch (e) {
+        console.error('TON Connect initialization error:', e);
+    }
+    
+    // Generate user fingerprint
+    function generateFingerprint() {
+        const data = {
+            userAgent: navigator.userAgent,
+            language: navigator.language,
+            platform: navigator.platform,
+            screenResolution: screen.width + 'x' + screen.height,
+            timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+            userId: tg.initDataUnsafe?.user?.id || 'unknown'
+        };
+        return btoa(JSON.stringify(data));
+    }
+    
+    userFingerprint = generateFingerprint();
+    
+    // Prevent screen recording
+    document.addEventListener('visibilitychange', function() {
+        if (document.hidden) {
+            const mediaContainer = document.getElementById('mediaContainer');
+            const media = mediaContainer.querySelector('video, img');
+            if (media && !document.querySelector('.content-viewer').dataset.hasAccess) {
+                media.style.display = 'none';
+            }
+        } else {
+            const media = document.querySelector('video, img');
+            if (media) media.style.display = 'block';
+        }
+    });
+    
+    // Disable screenshot
+    document.addEventListener('keyup', function(e) {
+        if (e.key === 'PrintScreen') {
+            navigator.clipboard.writeText('');
+            alert('التقاط الشاشة غير مسموح! 🚫');
+        }
+    });
+    
+    // Disable right-click and long-press
+    document.addEventListener('contextmenu', e => e.preventDefault());
+    
+    async function searchTicket() {
+        const ticket = document.getElementById('ticketInput').value.trim();
+        const message = document.getElementById('message');
+        
+        if (!ticket) {
+            message.innerHTML = '<div class="error-message">❌ الرجاء إدخال التيكت</div>';
+            return;
+        }
+        
+        message.innerHTML = '<div style="text-align: center;">⏳ جاري البحث...</div>';
+        
+        try {
+            const response = await fetch('/api/get-content', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({
+                    ticket: ticket,
+                    user_id: tg.initDataUnsafe?.user?.id || 0,
+                    fingerprint: userFingerprint
+                })
+            });
+            
+            const data = await response.json();
+            
+            if (data.success) {
+                currentTicket = ticket;
+                displayContent(data);
+                message.innerHTML = '';
+            } else {
+                message.innerHTML = '<div class="error-message">❌ ' + data.error + '</div>';
+            }
+        } catch (error) {
+            message.innerHTML = '<div class="error-message">❌ خطأ في الاتصال</div>';
+        }
+    }
+    
+    function displayContent(data) {
+        const viewer = document.getElementById('contentViewer');
+        const searchBox = document.getElementById('searchBox');
+        const mediaContainer = document.getElementById('mediaContainer');
+        const titleElement = document.getElementById('contentTitle');
+        
+        titleElement.textContent = data.title || 'محتوى حصري';
+        viewer.dataset.hasAccess = data.has_access;
+        
+        // Clear previous content
+        const oldMedia = mediaContainer.querySelector('video, img');
+        if (oldMedia) oldMedia.remove();
+        
+        // Display media
+        if (data.media_type === 'video') {
+            const video = document.createElement('video');
+            video.src = 'data:video/mp4;base64,' + data.media_data;
+            video.controls = data.has_access;
+            video.controlsList = 'nodownload';
+            video.disablePictureInPicture = true;
+            video.autoplay = true;
+            mediaContainer.insertBefore(video, mediaContainer.firstChild);
+            
+            if (!data.has_access && data.duration) {
+                startTimer(data.duration);
+            }
+        } else if (data.media_type === 'image') {
+            const img = document.createElement('img');
+            img.src = 'data:image/jpeg;base64,' + data.media_data;
+            mediaContainer.insertBefore(img, mediaContainer.firstChild);
+            
+            if (!data.has_access) {
+                startTimer(30);
+            }
+        }
+        
+        searchBox.style.display = 'none';
+        viewer.classList.add('active');
+    }
+    
+    function startTimer(duration) {
+        const timerOverlay = document.getElementById('timerOverlay');
+        const timerText = document.getElementById('timerText');
+        timerOverlay.style.display = 'block';
+        
+        let remaining = duration;
+        
+        timerInterval = setInterval(() => {
+            remaining--;
+            const minutes = Math.floor(remaining / 60);
+            const seconds = remaining % 60;
+            timerText.textContent = `${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
+            
+            if (remaining <= 0) {
+                clearInterval(timerInterval);
+                showPaymentModal();
+            }
+        }, 1000);
+    }
+    
+    async function showPaymentModal() {
+        document.getElementById('paymentModal').classList.add('active');
+        
+        // Pause video if playing
+        const video = document.querySelector('video');
+        if (video) video.pause();
+        
+        // Get TON price
+        try {
+            const response = await fetch('/api/get-ton-price');
+            const data = await response.json();
+            requiredTonAmount = data.ton_amount;
+            document.getElementById('tonPrice').textContent = `${requiredTonAmount.toFixed(4)} TON`;
+        } catch (e) {
+            document.getElementById('tonPrice').textContent = '~0.20 TON';
+            requiredTonAmount = 0.20;
+        }
+    }
+    
+    function closePaymentModal() {
+        document.getElementById('paymentModal').classList.remove('active');
+        if (paymentCheckInterval) {
+            clearInterval(paymentCheckInterval);
+        }
+    }
+    
+    async function initPayment() {
+        try {
+            if (!tonConnectUI || !tonConnectUI.connected) {
+                alert('الرجاء توصيل محفظة TON أولاً');
+                return;
+            }
+            
+            const response = await fetch('/api/create-payment', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({
+                    ticket: currentTicket,
+                    user_id: tg.initDataUnsafe?.user?.id || 0
+                })
+            });
+            
+            const data = await response.json();
+            
+            if (data.success) {
+                currentPaymentId = data.payment_id;
+                
+                // Send transaction via TON Connect
+                const transaction = {
+                    validUntil: Math.floor(Date.now() / 1000) + 600,
+                    messages: [
+                        {
+                            address: data.wallet_address,
+                            amount: data.amount_nano.toString(),
+                            payload: data.comment
+                        }
+                    ]
+                };
+                
+                try {
+                    const result = await tonConnectUI.sendTransaction(transaction);
+                    
+                    // Start checking for payment
+                    document.getElementById('paymentStatus').style.display = 'block';
+                    checkPaymentStatus(data.payment_id);
+                    
+                } catch (e) {
+                    console.error('Transaction error:', e);
+                    alert('فشلت العملية. حاول الدفع يدوياً إلى العنوان أدناه');
+                }
+            } else {
+                alert('خطأ في إنشاء الدفع: ' + data.error);
+            }
+        } catch (error) {
+            alert('خطأ في الاتصال');
+            console.error(error);
+        }
+    }
+    
+    async function checkPaymentStatus(paymentId) {
+        document.getElementById('paymentStatus').style.display = 'block';
+        
+        paymentCheckInterval = setInterval(async () => {
+            try {
+                const response = await fetch('/api/check-payment', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        payment_id: paymentId,
+                        ticket: currentTicket,
+                        user_id: tg.initDataUnsafe?.user?.id || 0
+                    })
+                });
+                
+                const data = await response.json();
+                
+                if (data.paid) {
+                    clearInterval(paymentCheckInterval);
+                    closePaymentModal();
+                    clearInterval(timerInterval);
+                    document.getElementById('timerOverlay').style.display = 'none';
+                    
+                    // Show success message
+                    const message = document.getElementById('message');
+                    message.innerHTML = '<div class="success-message">✅ تم الدفع بنجاح! استمتع بالمحتوى</div>';
+                    
+                    // Reload content with full access
+                    setTimeout(() => {
+                        searchTicket();
+                    }, 2000);
+                }
+            } catch (error) {
+                console.error('Error checking payment:', error);
+            }
+        }, 3000);
+        
+        // Stop checking after 10 minutes
+        setTimeout(() => {
+            if (paymentCheckInterval) {
+                clearInterval(paymentCheckInterval);
+                document.getElementById('paymentStatus').innerHTML = 
+                    '<p>⚠️ انتهى وقت الانتظار. إذا دفعت، سيتم تفعيل الوصول تلقائياً</p>';
+            }
+        }, 600000);
+    }
+    
+    function copyWallet() {
+        const wallet = 'UQABSEcWzJVmtLdZDUMyCs5EGrKOHWKWq3ftFNY0IItHgYTa';
+        
+        if (navigator.clipboard) {
+            navigator.clipboard.writeText(wallet).then(() => {
+                alert('✅ تم نسخ العنوان!');
+                
+                // Start checking for manual payment
+                if (!paymentCheckInterval) {
+                    createManualPayment();
+                }
+            });
+        } else {
+            alert('العنوان: ' + wallet);
+        }
+    }
+    
+    async function createManualPayment() {
+        try {
+            const response = await fetch('/api/create-payment', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({
+                    ticket: currentTicket,
+                    user_id: tg.initDataUnsafe?.user?.id || 0
+                })
+            });
+            
+            const data = await response.json();
+            
+            if (data.success) {
+                checkPaymentStatus(data.payment_id);
+            }
+        } catch (e) {
+            console.error('Error creating manual payment:', e);
+        }
+    }
+    
+    // Auto-check payment on page visibility
+    document.addEventListener('visibilitychange', function() {
+        if (!document.hidden && currentTicket && !paymentCheckInterval) {
+            // Check if user paid while app was in background
+            checkPaymentStatus('check');
+        }
+    });
+</script>
+```
 
-        # → twitter
-        chart_buf.seek(0)
-        tw_id = self.tw.post(sig, chart_buf)
+</body>
+</html>
+"""
 
-        self.db.set_msg_ids(sid, free=free_mid, paid=paid_mid, tw=tw_id)
-        log.info(f"✅ Signal #{sid} | {sig.symbol} | score={sig.score}")
+# TON Connect Manifest
 
-    async def send_report(self, sd: dict, res: dict, chart_buf: BytesIO):
-        sym = sd["symbol"].replace("-", "/")
-        lines_tp = []
-        for n in (1, 2, 3):
-            hit = res.get(f"tp{n}_hit", False)
-            price = sd[f"tp{n}"]
-            lines_tp.append(f"{'✅' if hit else '❌'}  TP{n}  <code>{price}</code>  "
-                            f"{'HIT ✓' if hit else '—'}")
-        sl_line = f"{'🔴  SL HIT ✗' if res.get('sl_hit') else '🟢  SL  Safe'}"
+TON_MANIFEST = {
+“url”: “”,  # Will be set dynamically
+“name”: “G🅾️reSignal”,
+“iconUrl”: “https://raw.githubusercontent.com/ton-blockchain/ton-connect/main/assets/ton_symbol.png”
+}
 
-        if res.get("sl_hit"):
-            pnl = (sd["sl"] - sd["entry"]) / sd["entry"] * 100
-            status = "🔴 STOPPED OUT"
-        elif all(res.get(f"tp{n}_hit") for n in (1, 2, 3)):
-            pnl = (sd["tp3"] - sd["entry"]) / sd["entry"] * 100
-            status = "🏆 ALL TARGETS HIT"
-        elif res.get("tp2_hit"):
-            pnl = (sd["tp2"] - sd["entry"]) / sd["entry"] * 100
-            status = "✅ PARTIAL PROFIT"
-        elif res.get("tp1_hit"):
-            pnl = (sd["tp1"] - sd["entry"]) / sd["entry"] * 100
-            status = "✅ PARTIAL PROFIT"
-        else:
-            pnl = 0
-            status = "⚪ EXPIRED"
+# Helper Functions
 
-        is_w = res.get("tp1_hit", False)
-        hdr = "🏆" if is_w else "📊"
+def generate_ticket():
+“”“Generate unique 8-character ticket ID”””
+return secrets.token_urlsafe(6)[:8]
 
-        txt = (
-            f"{hdr} <b>SIGNAL REPORT</b> {hdr}\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"📊  <b>{sym}</b>  ┃  {sd['mtype']}\n\n"
-            f"🟢  Entry: <code>{sd['entry']}</code>\n\n"
-            + "\n".join(lines_tp) + "\n"
-            f"{sl_line}\n\n"
-            f"📈  Status: <b>{status}</b>\n"
-            f"💰  PnL: <b>{pnl:+.2f}%</b> (Spot)\n"
-            f"💰  PnL: <b>{pnl*5:+.2f}%</b> (5x)\n"
-            f"💰  PnL: <b>{pnl*10:+.2f}%</b> (10x)\n\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"⚡ @EarlySpike"
-        )
+def add_watermark(image_bytes, text=”@GoreSignal”):
+“”“Add watermark to image”””
+try:
+img = Image.open(BytesIO(image_bytes))
+draw = ImageDraw.Draw(img)
 
-        for ch_id, mid_key in [(PAID_CHANNEL_ID, "paid_mid"), (FREE_CHANNEL_ID, "free_mid")]:
-            mid = sd.get(mid_key)
-            if not mid:
-                continue
-            try:
-                chart_buf.seek(0)
-                await self.app.bot.send_photo(
-                    ch_id, chart_buf, caption=txt, parse_mode="HTML",
-                    reply_to_message_id=mid)
-            except Exception:
-                try:
-                    chart_buf.seek(0)
-                    await self.app.bot.send_photo(
-                        ch_id, chart_buf, caption=txt, parse_mode="HTML")
-                except Exception as e:
-                    log.error(f"Report to {ch_id}: {e}")
+```
+    try:
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 30)
+    except:
+        font = ImageFont.load_default()
+    
+    width, height = img.size
+    positions = [
+        (50, 50), (width - 200, 50),
+        (50, height - 80), (width - 200, height - 80),
+        (width // 2 - 100, height // 2)
+    ]
+    
+    for pos in positions:
+        draw.text(pos, text, fill=(255, 255, 255, 128), font=font)
+    
+    output = BytesIO()
+    img.save(output, format='JPEG')
+    return output.getvalue()
+except Exception as e:
+    logger.error(f"Watermark error: {e}")
+    return image_bytes
+```
 
+def cleanup_expired_tickets():
+“”“Remove expired tickets”””
+current_time = datetime.now()
+expired = []
 
-# ════════════════════════════════════════════════════════════
-#  SIGNAL MONITOR — tracks TP/SL for active signals
-# ════════════════════════════════════════════════════════════
+```
+for ticket_id, data in tickets_storage.items():
+    created_at = datetime.fromisoformat(data['created_at'])
+    if current_time - created_at > timedelta(days=TICKET_EXPIRY_DAYS):
+        expired.append(ticket_id)
 
-class Monitor:
-    def __init__(self, db: DB, okx: OKX, bot: Bot):
-        self.db = db
-        self.okx = okx
-        self.bot = bot
+for ticket_id in expired:
+    del tickets_storage[ticket_id]
+    logger.info(f"Deleted expired ticket: {ticket_id}")
+```
 
-    async def tick(self):
-        for sig in self.db.active_signals():
-            try:
-                tk = self.okx.ticker(sig["symbol"])
-                if not tk:
-                    continue
-                price = float(tk.get("last", 0))
-                if price <= 0:
-                    continue
+def cleanup_expired_payments():
+“”“Remove expired pending payments”””
+current_time = datetime.now()
+expired = []
 
-                changed = False
+```
+for payment_id, data in pending_payments.items():
+    created_at = datetime.fromisoformat(data['created_at'])
+    if current_time - created_at > timedelta(hours=1):  # 1 hour expiry
+        expired.append(payment_id)
 
-                # TP checks
-                if not sig["tp1_hit"] and price >= sig["tp1"]:
-                    self.db.hit_tp(sig["id"], 1); sig["tp1_hit"] = 1; changed = True
-                if not sig["tp2_hit"] and sig["tp1_hit"] and price >= sig["tp2"]:
-                    self.db.hit_tp(sig["id"], 2); sig["tp2_hit"] = 1; changed = True
-                if not sig["tp3_hit"] and sig["tp2_hit"] and price >= sig["tp3"]:
-                    self.db.hit_tp(sig["id"], 3); sig["tp3_hit"] = 1; changed = True
+for payment_id in expired:
+    del pending_payments[payment_id]
+```
 
-                # SL check
-                if not sig["sl_hit"] and price <= sig["sl"]:
-                    self.db.hit_sl(sig["id"]); sig["sl_hit"] = 1; changed = True
+# Flask Routes
 
-                # Expiry
-                created = datetime.fromisoformat(sig["created_at"])
-                if datetime.utcnow() - created > timedelta(hours=SIGNAL_EXPIRY_H):
-                    st = "PARTIAL_TP" if sig["tp1_hit"] else "EXPIRED"
-                    self.db.close_sig(sig["id"], st)
-                    changed = True
+@app.route(’/’)
+def index():
+return render_template_string(MINI_APP_HTML)
 
-                # Send report if closed
-                if changed:
-                    fresh = self.db.get_sig(sig["id"])
-                    if fresh and fresh["status"] != "ACTIVE":
-                        await self._report(fresh)
-            except Exception as e:
-                log.error(f"Monitor {sig['symbol']}: {e}")
+@app.route(’/tonconnect-manifest.json’)
+def ton_manifest():
+“”“TON Connect manifest”””
+manifest = TON_MANIFEST.copy()
+manifest[‘url’] = request.host_url.rstrip(’/’)
+return jsonify(manifest)
 
-    async def _report(self, sd):
-        try:
-            candles = self.okx.candles(sd["symbol"], "5m", 100)
-            if candles:
-                candles = list(reversed(candles))
-            res = {f"tp{n}_hit": bool(sd[f"tp{n}_hit"]) for n in (1, 2, 3)}
-            res["sl_hit"] = bool(sd["sl_hit"])
-            buf = chart_report(candles, sd, res)
-            await self.bot.send_report(sd, res, buf)
-            log.info(f"📋 Report #{sd['id']} {sd['symbol']}")
-        except Exception as e:
-            log.error(f"Report gen: {e}")
+@app.route(’/health’)
+def health():
+“”“Uptime endpoint for render.com”””
+return jsonify({
+“status”: “ok”,
+“timestamp”: datetime.now().isoformat(),
+“tickets”: len(tickets_storage),
+“pending_payments”: len(pending_payments)
+})
 
+@app.route(’/api/get-ton-price’)
+def get_ton_price_api():
+“”“Get current TON price and required amount”””
+ton_amount = usd_to_ton(PAYMENT_AMOUNT_USD)
+return jsonify({
+“ton_amount”: ton_amount,
+“usd_amount”: PAYMENT_AMOUNT_USD,
+“ton_price_usd”: get_ton_price_usd()
+})
 
-# ════════════════════════════════════════════════════════════
-#  MEMORY MANAGER
-# ════════════════════════════════════════════════════════════
+@app.route(’/api/get-content’, methods=[‘POST’])
+def get_content():
+“”“API endpoint to retrieve content by ticket”””
+try:
+data = request.json
+ticket = data.get(‘ticket’, ‘’).strip()
+user_id = data.get(‘user_id’, 0)
+fingerprint = data.get(‘fingerprint’, ‘’)
 
-def mem_clean():
-    plt.close("all")
-    gc.collect()
+```
+    cleanup_expired_tickets()
+    
+    if ticket not in tickets_storage:
+        return jsonify({"success": False, "error": "تيكت غير صالح أو منتهي"})
+    
+    ticket_data = tickets_storage[ticket]
+    
+    # Check if ticket is expired
+    created_at = datetime.fromisoformat(ticket_data['created_at'])
+    if datetime.now() - created_at > timedelta(days=TICKET_EXPIRY_DAYS):
+        return jsonify({"success": False, "error": "التيكت منتهي الصلاحية"})
+    
+    # Check user access
+    user_key = str(user_id)
+    has_paid_access = False
+    
+    if user_key in user_access and ticket in user_access[user_key]:
+        user_ticket_data = user_access[user_key][ticket]
+        
+        # Check fingerprint match
+        if user_ticket_data.get('fingerprint') != fingerprint:
+            return jsonify({"success": False, "error": "تم الكشف عن محاولة وصول غير مصرح بها"})
+        
+        if user_ticket_data.get('paid'):
+            # Check if payment is still valid (3 days)
+            paid_at = datetime.fromisoformat(user_ticket_data.get('paid_at', ticket_data['created_at']))
+            if datetime.now() - paid_at <= timedelta(days=TICKET_EXPIRY_DAYS):
+                has_paid_access = True
+    else:
+        # First time viewing - record fingerprint
+        if user_key not in user_access:
+            user_access[user_key] = {}
+        user_access[user_key][ticket] = {
+            'paid': False,
+            'first_viewed_at': datetime.now().isoformat(),
+            'fingerprint': fingerprint
+        }
+    
+    return jsonify({
+        "success": True,
+        "media_type": ticket_data['media_type'],
+        "media_data": ticket_data['media_data'],
+        "title": ticket_data.get('title', ''),
+        "has_access": has_paid_access,
+        "duration": ticket_data.get('duration', 120)
+    })
+    
+except Exception as e:
+    logger.error(f"Get content error: {e}")
+    return jsonify({"success": False, "error": "خطأ في السيرفر"})
+```
 
+@app.route(’/api/create-payment’, methods=[‘POST’])
+def create_payment():
+“”“Create TON payment request”””
+try:
+data = request.json
+ticket = data.get(‘ticket’)
+user_id = data.get(‘user_id’)
 
-# ════════════════════════════════════════════════════════════
-#  FLASK KEEP-ALIVE  (for UptimeRobot / Render)
-# ════════════════════════════════════════════════════════════
+```
+    cleanup_expired_payments()
+    
+    # Generate payment ID
+    payment_id = str(uuid.uuid4())
+    
+    # Calculate TON amount
+    ton_amount = usd_to_ton(PAYMENT_AMOUNT_USD)
+    amount_nano = ton_to_nanoton(ton_amount)
+    
+    # Store pending payment
+    pending_payments[payment_id] = {
+        'ticket': ticket,
+        'user_id': user_id,
+        'amount_nano': amount_nano,
+        'amount_ton': ton_amount,
+        'created_at': datetime.now().isoformat(),
+        'status': 'pending'
+    }
+    
+    # Create payment comment for tracking
+    comment = f"GoreSignal_{payment_id[:8]}"
+    
+    logger.info(f"Created payment: {payment_id} for user {user_id}, ticket {ticket}, amount {ton_amount} TON")
+    
+    return jsonify({
+        "success": True,
+        "payment_id": payment_id,
+        "wallet_address": HOT_WALLET,
+        "amount_nano": amount_nano,
+        "amount_ton": ton_amount,
+        "comment": comment
+    })
+    
+except Exception as e:
+    logger.error(f"Create payment error: {e}")
+    return jsonify({"success": False, "error": str(e)})
+```
 
-flask_app = Flask(__name__)
+@app.route(’/api/check-payment’, methods=[‘POST’])
+def check_payment():
+“”“Check if payment was completed”””
+try:
+data = request.json
+payment_id = data.get(‘payment_id’)
+ticket = data.get(‘ticket’)
+user_id = str(data.get(‘user_id’))
 
-@flask_app.route("/")
-def _home():
-    return (
-        "<h1>⚡ EarlySpike</h1>"
-        f"<p>Running | {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}</p>"
+```
+    # If payment_id is 'check', look for any recent payment for this user/ticket
+    if payment_id == 'check':
+        # Find recent payment for this user and ticket
+        for pid, pdata in pending_payments.items():
+            if pdata.get('ticket') == ticket and str(pdata.get('user_id')) == user_id:
+                payment_id = pid
+                break
+        
+        if not payment_id or payment_id == 'check':
+            return jsonify({"paid": False})
+    
+    if payment_id not in pending_payments:
+        # Check if already processed
+        if user_id in user_access and ticket in user_access.get(user_id, {}):
+            if user_access[user_id][ticket].get('paid'):
+                return jsonify({"paid": True})
+        return jsonify({"paid": False})
+    
+    payment_data = pending_payments[payment_id]
+    
+    # Check if already marked as paid
+    if payment_data.get('status') == 'completed':
+        return jsonify({"paid": True})
+    
+    # Get payment creation timestamp
+    created_at = datetime.fromisoformat(payment_data['created_at'])
+    since_timestamp = int(created_at.timestamp())
+    
+    # Check for incoming transactions
+    transactions = check_incoming_transactions(
+        HOT_WALLET,
+        payment_data['amount_nano'],
+        since_timestamp
     )
+    
+    if transactions:
+        # Payment found!
+        tx = transactions[0]  # Get most recent
+        
+        logger.info(f"Payment verified! TxHash: {tx['hash']}, Amount: {tx['value']} nano, User: {user_id}, Ticket: {ticket}")
+        
+        # Grant access
+        if user_id not in user_access:
+            user_access[user_id] = {}
+        
+        user_access[user_id][ticket] = {
+            'paid': True,
+            'paid_at': datetime.now().isoformat(),
+            'fingerprint': user_access.get(user_id, {}).get(ticket, {}).get('fingerprint', ''),
+            'tx_hash': tx['hash'],
+            'amount_paid': tx['value']
+        }
+        
+        # Mark payment as completed
+        payment_data['status'] = 'completed'
+        payment_data['tx_hash'] = tx['hash']
+        payment_data['completed_at'] = datetime.now().isoformat()
+        
+        # Notify admin
+        asyncio.create_task(notify_admin_payment(
+            user_id, 
+            ticket, 
+            payment_id, 
+            tx['value'] / 1_000_000_000,  # Convert to TON
+            tx['hash']
+        ))
+        
+        return jsonify({"paid": True, "tx_hash": tx['hash']})
+    
+    return jsonify({"paid": False})
+    
+except Exception as e:
+    logger.error(f"Check payment error: {e}")
+    return jsonify({"paid": False, "error": str(e)})
+```
 
-@flask_app.route("/health")
-def _health():
-    return {"status": "ok", "ts": datetime.now(timezone.utc).isoformat()}
+# Telegram Bot Handlers
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+“”“Handle /start command”””
+user_id = update.effective_user.id
+
+```
+if user_id == ADMIN_ID:
+    app_url = os.environ.get("RENDER_EXTERNAL_URL", request.host_url if 'request' in dir() else "https://your-app.onrender.com")
+    
+    await update.message.reply_text(
+        f"🔥 مرحباً بك أيها الأدمن!\n\n"
+        f"🌐 رابط التطبيق:\n{app_url}\n\n"
+        f"📊 الإحصائيات:\n"
+        f"📝 التيكتات النشطة: {len(tickets_storage)}\n"
+        f"💰 الدفعات المعلقة: {len(pending_payments)}\n"
+        f"👥 المستخدمين: {len(user_access)}\n\n"
+        f"📤 أرسل محتوى (فيديو/صورة) لبدء إنشاء تيكت جديد\n"
+        f"🔗 استخدم /link لتعيين رابط ouo.io\n"
+        f"📊 استخدم /stats لعرض الإحصائيات التفصيلية",
+        disable_web_page_preview=True
+    )
+else:
+    await update.message.reply_text(
+        "⚠️ هذا البوت مخصص للأدمن فقط!\n"
+        "للوصول للمحتوى، استخدم التطبيق المصغر."
+    )
+```
+
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+“”“Handle /stats command”””
+if update.effective_user.id != ADMIN_ID:
+return
+
+```
+# Calculate stats
+total_paid = sum(1 for user_tickets in user_access.values() 
+                 for ticket_data in user_tickets.values() 
+                 if ticket_data.get('paid'))
+
+total_revenue_nano = sum(ticket_data.get('amount_paid', 0) 
+                         for user_tickets in user_access.values() 
+                         for ticket_data in user_tickets.values() 
+                         if ticket_data.get('paid'))
+
+total_revenue_ton = total_revenue_nano / 1_000_000_000
+ton_price = get_ton_price_usd()
+total_revenue_usd = total_revenue_ton * ton_price
+
+completed_payments = sum(1 for p in pending_payments.values() if p.get('status') == 'completed')
+pending = len(pending_payments) - completed_payments
+
+stats_text = (
+    f"📊 إحصائيات G🅾️reSignal\n\n"
+    f"📝 التيكتات النشطة: {len(tickets_storage)}\n"
+    f"👥 إجمالي المستخدمين: {len(user_access)}\n\n"
+    f"💰 الدفعات:\n"
+    f"✅ مكتملة: {total_paid}\n"
+    f"⏳ معلقة: {pending}\n\n"
+    f"💵 الإيرادات:\n"
+    f"🔷 {total_revenue_ton:.4f} TON\n"
+    f"💵 ${total_revenue_usd:.2f} USD\n\n"
+    f"📈 سعر TON الحالي: ${ton_price:.2f}"
+)
+
+await update.message.reply_text(stats_text)
+```
+
+async def link_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+“”“Handle /link command to set ouo.io link”””
+global ouo_link
+
+```
+if update.effective_user.id != ADMIN_ID:
+    return
+
+if context.args:
+    ouo_link = context.args[0]
+    await update.message.reply_text(f"✅ تم تعيين الرابط:\n{ouo_link}")
+else:
+    await update.message.reply_text(
+        f"📎 الرابط الحالي:\n{ouo_link if ouo_link else 'لم يتم التعيين'}\n\n"
+        f"لتغيير الرابط: /link <رابط_جديد>"
+    )
+```
+
+async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
+“”“Handle media uploads from admin”””
+if update.effective_user.id != ADMIN_ID:
+return
+
+```
+try:
+    # Generate ticket
+    ticket_id = generate_ticket()
+    
+    # Ask for title
+    await update.message.reply_text(
+        f"🎫 تم إنشاء التيكت: `{ticket_id}`\n\n"
+        f"📝 أرسل عنوان المحتوى:",
+        parse_mode='Markdown'
+    )
+    
+    # Store media temporarily
+    media_type = None
+    media_data = None
+    duration = 120  # Default
+    
+    if update.message.photo:
+        photo = update.message.photo[-1]
+        file = await context.bot.get_file(photo.file_id)
+        photo_bytes = await file.download_as_bytearray()
+        
+        watermarked = add_watermark(bytes(photo_bytes))
+        media_data = base64.b64encode(watermarked).decode()
+        media_type = 'image'
+        duration = 30
+        
+    elif update.message.video:
+        video = update.message.video
+        file = await context.bot.get_file(video.file_id)
+        video_bytes = await file.download_as_bytearray()
+        
+        media_data = base64.b64encode(bytes(video_bytes)).decode()
+        media_type = 'video'
+        duration = video.duration if video.duration else 120
+        
+    elif update.message.document:
+        document = update.message.document
+        if document.mime_type and 'video' in document.mime_type:
+            file = await context.bot.get_file(document.file_id)
+            video_bytes = await file.download_as_bytearray()
+            media_data = base64.b64encode(bytes(video_bytes)).decode()
+            media_type = 'video'
+        elif document.mime_type and 'image' in document.mime_type:
+            file = await context.bot.get_file(document.file_id)
+            image_bytes = await file.download_as_bytearray()
+            watermarked = add_watermark(bytes(image_bytes))
+            media_data = base64.b64encode(watermarked).decode()
+            media_type = 'image'
+            duration = 30
+    
+    if media_data:
+        tickets_storage[ticket_id] = {
+            'media_type': media_type,
+            'media_data': media_data,
+            'created_at': datetime.now().isoformat(),
+            'title': '',
+            'duration': duration
+        }
+        
+        context.user_data['pending_ticket'] = ticket_id
+        
+except Exception as e:
+    logger.error(f"Handle media error: {e}")
+    await update.message.reply_text(f"❌ خطأ: {str(e)}")
+```
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+“”“Handle text messages (titles)”””
+if update.effective_user.id != ADMIN_ID:
+return
+
+```
+pending_ticket = context.user_data.get('pending_ticket')
+
+if pending_ticket and pending_ticket in tickets_storage:
+    title = update.message.text
+    tickets_storage[pending_ticket]['title'] = title
+    
+    await post_to_group(context.bot, pending_ticket, title)
+    
+    context.user_data.pop('pending_ticket', None)
+    
+    await update.message.reply_text(
+        f"✅ تم نشر المحتوى بنجاح!\n\n"
+        f"🎫 التيكت: `{pending_ticket}`\n"
+        f"📝 العنوان: {title}\n"
+        f"⏱️ صلاحية: {TICKET_EXPIRY_DAYS} أيام",
+        parse_mode='Markdown'
+    )
+```
+
+async def post_to_group(bot, ticket_id, title):
+“”“Post content to group with watermarked preview”””
+try:
+ticket_data = tickets_storage[ticket_id]
+
+```
+    keyboard = [[InlineKeyboardButton("🔥 شاهد مجاناً", url=ouo_link if ouo_link else "https://t.me/GoreSignal")]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    ton_amount = usd_to_ton(PAYMENT_AMOUNT_USD)
+    
+    message_text = (
+        f"🔥 {title}\n\n"
+        f"🎫 التيكت: `{ticket_id}`\n\n"
+        f"💎 الوصول الكامل:\n"
+        f"💵 ${PAYMENT_AMOUNT_USD} USD\n"
+        f"🔷 ~{ton_amount:.4f} TON\n"
+        f"⏱️ صلاحية 3 أيام\n\n"
+        f"📌 كيفية المشاهدة:\n"
+        f"1️⃣ انسخ التيكت أعلاه\n"
+        f"2️⃣ اضغط على الزر بالأسفل\n"
+        f"3️⃣ الصق التيكت في التطبيق\n"
+        f"4️⃣ شاهد مجاناً أو ادفع للوصول الكامل"
+    )
+    
+    if ticket_data['media_type'] == 'image':
+        image_bytes = base64.b64decode(ticket_data['media_data'])
+        await bot.send_photo(
+            chat_id=GROUP_CHAT_ID,
+            photo=BytesIO(image_bytes),
+            caption=message_text,
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+    else:
+        await bot.send_message(
+            chat_id=GROUP_CHAT_ID,
+            text=message_text,
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+        
+except Exception as e:
+    logger.error(f"Post to group error: {e}")
+```
+
+async def notify_admin_payment(user_id, ticket, payment_id, amount_ton, tx_hash):
+“”“Notify admin about payment”””
+try:
+bot = telegram_app.bot
+ton_price = get_ton_price_usd()
+amount_usd = amount_ton * ton_price
+
+```
+    await bot.send_message(
+        chat_id=ADMIN_ID,
+        text=(
+            f"💰 دفعة جديدة!\n\n"
+            f"👤 المستخدم: `{user_id}`\n"
+            f"🎫 التيكت: `{ticket}`\n"
+            f"💳 معرف الدفع: `{payment_id[:16]}...`\n"
+            f"💵 المبلغ: {amount_ton:.4f} TON (${amount_usd:.2f})\n"
+            f"🔗 المعاملة: `{tx_hash[:16]}...`\n"
+            f"⏰ الوقت: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        ),
+        parse_mode='Markdown'
+    )
+except Exception as e:
+    logger.error(f"Notify admin error: {e}")
+```
+
+# Initialize Telegram Bot
+
+telegram_app = Application.builder().token(BOT_TOKEN).build()
+
+telegram_app.add_handler(CommandHandler(“start”, start_command))
+telegram_app.add_handler(CommandHandler(“link”, link_command))
+telegram_app.add_handler(CommandHandler(“stats”, stats_command))
+telegram_app.add_handler(MessageHandler(filters.PHOTO | filters.VIDEO | filters.Document.ALL, handle_media))
+telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
+# Run both Flask and Telegram bot
 
 def run_flask():
-    flask_app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
+“”“Run Flask app”””
+app.run(host=‘0.0.0.0’, port=PORT)
 
+def run_telegram():
+“”“Run Telegram bot”””
+asyncio.set_event_loop(asyncio.new_event_loop())
+telegram_app.run_polling(allowed_updates=Update.ALL_TYPES)
 
-# ════════════════════════════════════════════════════════════
-#  VERIFICATION CLEANER
-# ════════════════════════════════════════════════════════════
+if **name** == ‘**main**’:
+logger.info(“Starting G🅾️reSignal Bot…”)
+logger.info(f”Admin ID: {ADMIN_ID}”)
+logger.info(f”Group Chat ID: {GROUP_CHAT_ID}”)
+logger.info(f”Hot Wallet: {HOT_WALLET}”)
+logger.info(f”Payment Amount: ${PAYMENT_AMOUNT_USD} USD”)
 
-async def clean_pending(app: Application, db: DB):
-    for e in db.expired_pending(10):
-        try:
-            await app.bot.ban_chat_member(e["cid"], e["uid"])
-            await asyncio.sleep(1)
-            await app.bot.unban_chat_member(e["cid"], e["uid"], only_if_banned=True)
-            log.info(f"👢 Kicked unverified {e['uid']}")
-        except Exception as ex:
-            log.error(f"Kick: {ex}")
-        finally:
-            db.rm_pending(e["uid"])
+```
+# Start Flask in separate thread
+flask_thread = Thread(target=run_flask)
+flask_thread.daemon = True
+flask_thread.start()
 
+# Run Telegram bot in main thread
+run_telegram()
+```
 
-# ════════════════════════════════════════════════════════════
-#  MAIN ASYNC LOOP
-# ════════════════════════════════════════════════════════════
+# HTML Template for Mini App
 
-async def engine(bot: Bot, det: Detector, mon: Monitor, db: DB):
-    log.info("🚀 Engine started")
-    cycle = 0
+MINI_APP_HTML = “””
 
-    while True:
-        try:
-            cycle += 1
+<!DOCTYPE html>
 
-            # ── scan for new signals ─────────────────────────
-            log.info(f"🔍 Scan #{cycle}")
-            signals = det.scan()
-            if signals:
-                log.info(f"📡 {len(signals)} candidates")
-                for sig in signals[:5]:
-                    try:
-                        candles_raw = sig.candles_raw
-                        if not candles_raw:
-                            candles_raw = det.okx.candles(sig.symbol, "5m", 100)
-                            if candles_raw:
-                                candles_raw = list(reversed(candles_raw))
-                        buf = chart_signal(candles_raw or [], sig)
-                        await bot.send_signal(sig, buf)
-                        await asyncio.sleep(2)
-                    except Exception as e:
-                        log.error(f"Signal send {sig.symbol}: {e}")
+<html lang="ar" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-select=none">
+    <title>G🅾️reSignal</title>
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+            -webkit-user-select: none;
+            -moz-user-select: none;
+            -ms-user-select: none;
+            user-select: none;
+        }
 
-            # ── monitor loop (4 × 15s = 60s) ────────────────
-            for _ in range(4):
-                await mon.tick()
-                await asyncio.sleep(MONITOR_INTERVAL)
+```
+    body {
+        font-family: 'Arial', sans-serif;
+        background: linear-gradient(135deg, #1a1a1a 0%, #2d2d2d 100%);
+        color: #fff;
+        min-height: 100vh;
+        padding: 20px;
+        overflow-x: hidden;
+    }
+    
+    .logo {
+        text-align: center;
+        margin-bottom: 30px;
+    }
+    
+    .logo img {
+        width: 80px;
+        height: 80px;
+        border-radius: 50%;
+        border: 3px solid #ff4444;
+        pointer-events: none;
+    }
+    
+    .logo h1 {
+        margin-top: 10px;
+        font-size: 28px;
+        color: #ff4444;
+    }
+    
+    .container {
+        max-width: 600px;
+        margin: 0 auto;
+    }
+    
+    .search-box {
+        background: rgba(255,255,255,0.1);
+        border-radius: 15px;
+        padding: 20px;
+        margin-bottom: 20px;
+        backdrop-filter: blur(10px);
+    }
+    
+    .search-box input {
+        width: 100%;
+        padding: 15px;
+        border: 2px solid #ff4444;
+        border-radius: 10px;
+        background: rgba(0,0,0,0.5);
+        color: #fff;
+        font-size: 16px;
+        font-family: monospace;
+        text-align: center;
+    }
+    
+    .search-box button {
+        width: 100%;
+        padding: 15px;
+        margin-top: 10px;
+        border: none;
+        border-radius: 10px;
+        background: #ff4444;
+        color: #fff;
+        font-size: 18px;
+        font-weight: bold;
+        cursor: pointer;
+        transition: 0.3s;
+    }
+    
+    .search-box button:active {
+        transform: scale(0.95);
+        background: #cc0000;
+    }
+    
+    .content-viewer {
+        display: none;
+        background: rgba(255,255,255,0.1);
+        border-radius: 15px;
+        padding: 20px;
+        backdrop-filter: blur(10px);
+    }
+    
+    .content-viewer.active {
+        display: block;
+    }
+    
+    .media-container {
+        position: relative;
+        width: 100%;
+        max-width: 100%;
+        border-radius: 10px;
+        overflow: hidden;
+        background: #000;
+        pointer-events: none;
+    }
+    
+    .media-container video,
+    .media-container img {
+        width: 100%;
+        height: auto;
+        display: block;
+        pointer-events: none;
+    }
+    
+    .timer-overlay {
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        background: rgba(255,68,68,0.9);
+        color: #fff;
+        padding: 15px;
+        text-align: center;
+        font-size: 18px;
+        font-weight: bold;
+        z-index: 1000;
+    }
+    
+    .payment-modal {
+        display: none;
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        background: rgba(0,0,0,0.95);
+        z-index: 2000;
+        padding: 20px;
+        align-items: center;
+        justify-content: center;
+    }
+    
+    .payment-modal.active {
+        display: flex;
+    }
+    
+    .payment-content {
+        background: linear-gradient(135deg, #2d2d2d 0%, #1a1a1a 100%);
+        border-radius: 20px;
+        padding: 30px;
+        max-width: 400px;
+        width: 100%;
+        text-align: center;
+        border: 2px solid #ff4444;
+    }
+    
+    .payment-content h2 {
+        color: #ff4444;
+        margin-bottom: 20px;
+    }
+    
+    .payment-content button {
+        width: 100%;
+        padding: 15px;
+        margin-top: 15px;
+        border: none;
+        border-radius: 10px;
+        background: #ff4444;
+        color: #fff;
+        font-size: 16px;
+        font-weight: bold;
+        cursor: pointer;
+    }
+    
+    .error-message {
+        background: rgba(255,68,68,0.2);
+        border: 2px solid #ff4444;
+        border-radius: 10px;
+        padding: 15px;
+        margin-top: 10px;
+        text-align: center;
+    }
+    
+    .success-message {
+        background: rgba(68,255,68,0.2);
+        border: 2px solid #44ff44;
+        border-radius: 10px;
+        padding: 15px;
+        margin-top: 10px;
+        text-align: center;
+        color: #44ff44;
+    }
+    
+    .watermark-overlay {
+        position: absolute;
+        top: 0;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        pointer-events: none;
+        z-index: 100;
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        grid-template-rows: repeat(3, 1fr);
+        opacity: 0.3;
+    }
+    
+    .watermark-overlay span {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        color: #fff;
+        font-weight: bold;
+        font-size: 14px;
+        text-shadow: 2px 2px 4px rgba(0,0,0,0.8);
+    }
+</style>
+```
 
-            # ── verification cleanup every 5 cycles ──────────
-            if cycle % 5 == 0:
-                await clean_pending(bot.app, db)
+</head>
+<body>
+    <div class="logo">
+        <img src="data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iODAiIGhlaWdodD0iODAiIHZpZXdCb3g9IjAgMCA4MCA4MCIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPGNpcmNsZSBjeD0iNDAiIGN5PSI0MCIgcj0iMzgiIHN0cm9rZT0iI2ZmNDQ0NCIgc3Ryb2tlLXdpZHRoPSI0Ii8+CjxwYXRoIGQ9Ik0zMCAyNUw0NSAyNUw1MCAzNUw0NSA0NUw1MCA1NUwzNSA1NUwzMCA0NUwzNSAzNUwzMCAyNVoiIGZpbGw9IiNmZjQ0NDQiLz4KPC9zdmc+Cg==" alt="Logo">
+        <h1>G🅾️reSignal</h1>
+    </div>
 
-            # ── memory cleanup every 30 cycles ───────────────
-            if cycle % 30 == 0:
-                mem_clean()
-                det.okx.clear()
-                log.info("🧹 Memory cleaned")
+```
+<div class="container">
+    <div class="search-box" id="searchBox">
+        <input type="text" id="ticketInput" placeholder="أدخل التيكت هنا" maxlength="8">
+        <button onclick="searchTicket()">🔍 بحث</button>
+        <div id="message"></div>
+    </div>
+    
+    <div class="content-viewer" id="contentViewer">
+        <h2 id="contentTitle" style="margin-bottom: 15px; text-align: center;"></h2>
+        <div class="media-container" id="mediaContainer">
+            <div class="watermark-overlay">
+                <span>@GoreSignal</span>
+                <span>@GoreSignal</span>
+                <span>@GoreSignal</span>
+                <span>@GoreSignal</span>
+                <span>@GoreSignal</span>
+                <span>@GoreSignal</span>
+                <span>@GoreSignal</span>
+                <span>@GoreSignal</span>
+                <span>@GoreSignal</span>
+            </div>
+        </div>
+    </div>
+</div>
 
-        except Exception as e:
-            log.error(f"Engine: {e}\n{traceback.format_exc()}")
-            await asyncio.sleep(30)
+<div class="timer-overlay" id="timerOverlay" style="display: none;">
+    ⏱️ الوقت المتبقي: <span id="timerText">00:00</span>
+</div>
 
+<div class="payment-modal" id="paymentModal">
+    <div class="payment-content">
+        <h2>💎 فتح محتوى غير محدود</h2>
+        <p>ادفع 0.99$ TON للوصول الكامل لمدة 3 أيام</p>
+        <button onclick="initPayment()">💳 الدفع الآن</button>
+        <button onclick="closePaymentModal()" style="background: #666; margin-top: 10px;">إلغاء</button>
+    </div>
+</div>
 
-# ════════════════════════════════════════════════════════════
-#  ENTRY POINT
-# ════════════════════════════════════════════════════════════
+<script>
+    let tg = window.Telegram.WebApp;
+    tg.expand();
+    tg.disableVerticalSwipes();
+    
+    let currentTicket = '';
+    let timerInterval = null;
+    let userFingerprint = '';
+    
+    // Generate user fingerprint
+    function generateFingerprint() {
+        const data = {
+            userAgent: navigator.userAgent,
+            language: navigator.language,
+            platform: navigator.platform,
+            screenResolution: screen.width + 'x' + screen.height,
+            timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+            userId: tg.initDataUnsafe?.user?.id || 'unknown'
+        };
+        return btoa(JSON.stringify(data));
+    }
+    
+    userFingerprint = generateFingerprint();
+    
+    // Prevent screen recording
+    document.addEventListener('visibilitychange', function() {
+        if (document.hidden) {
+            const mediaContainer = document.getElementById('mediaContainer');
+            mediaContainer.innerHTML = '<div class="watermark-overlay"><span>@GoreSignal</span></div>';
+        }
+    });
+    
+    // Disable screenshot (limited browser support)
+    document.addEventListener('keyup', function(e) {
+        if (e.key === 'PrintScreen') {
+            navigator.clipboard.writeText('');
+            alert('التقاط الشاشة غير مسموح! 🚫');
+        }
+    });
+    
+    // Disable right-click and long-press
+    document.addEventListener('contextmenu', e => e.preventDefault());
+    document.addEventListener('touchstart', preventLongPress);
+    document.addEventListener('touchend', preventLongPress);
+    
+    function preventLongPress(e) {
+        if (e.target.tagName === 'VIDEO' || e.target.tagName === 'IMG') {
+            e.preventDefault();
+        }
+    }
+    
+    async function searchTicket() {
+        const ticket = document.getElementById('ticketInput').value.trim();
+        const message = document.getElementById('message');
+        
+        if (!ticket) {
+            message.innerHTML = '<div class="error-message">❌ الرجاء إدخال التيكت</div>';
+            return;
+        }
+        
+        message.innerHTML = '<div style="text-align: center;">⏳ جاري البحث...</div>';
+        
+        try {
+            const response = await fetch('/api/get-content', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({
+                    ticket: ticket,
+                    user_id: tg.initDataUnsafe?.user?.id || 0,
+                    fingerprint: userFingerprint
+                })
+            });
+            
+            const data = await response.json();
+            
+            if (data.success) {
+                currentTicket = ticket;
+                displayContent(data);
+                message.innerHTML = '';
+            } else {
+                message.innerHTML = '<div class="error-message">❌ ' + data.error + '</div>';
+            }
+        } catch (error) {
+            message.innerHTML = '<div class="error-message">❌ خطأ في الاتصال</div>';
+        }
+    }
+    
+    function displayContent(data) {
+        const viewer = document.getElementById('contentViewer');
+        const searchBox = document.getElementById('searchBox');
+        const mediaContainer = document.getElementById('mediaContainer');
+        const titleElement = document.getElementById('contentTitle');
+        
+        titleElement.textContent = data.title || 'محتوى حصري';
+        
+        // Clear previous content
+        const oldMedia = mediaContainer.querySelector('video, img');
+        if (oldMedia) oldMedia.remove();
+        
+        // Display media
+        if (data.media_type === 'video') {
+            const video = document.createElement('video');
+            video.src = 'data:video/mp4;base64,' + data.media_data;
+            video.controls = data.has_access;
+            video.controlsList = 'nodownload';
+            video.disablePictureInPicture = true;
+            video.autoplay = true;
+            mediaContainer.insertBefore(video, mediaContainer.firstChild);
+            
+            if (!data.has_access && data.duration) {
+                startTimer(data.duration);
+            }
+        } else if (data.media_type === 'image') {
+            const img = document.createElement('img');
+            img.src = 'data:image/jpeg;base64,' + data.media_data;
+            mediaContainer.insertBefore(img, mediaContainer.firstChild);
+            
+            if (!data.has_access) {
+                startTimer(30); // 30 seconds for images
+            }
+        }
+        
+        searchBox.style.display = 'none';
+        viewer.classList.add('active');
+    }
+    
+    function startTimer(duration) {
+        const timerOverlay = document.getElementById('timerOverlay');
+        const timerText = document.getElementById('timerText');
+        timerOverlay.style.display = 'block';
+        
+        let remaining = duration;
+        
+        timerInterval = setInterval(() => {
+            remaining--;
+            const minutes = Math.floor(remaining / 60);
+            const seconds = remaining % 60;
+            timerText.textContent = `${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
+            
+            if (remaining <= 0) {
+                clearInterval(timerInterval);
+                showPaymentModal();
+            }
+        }, 1000);
+    }
+    
+    function showPaymentModal() {
+        document.getElementById('paymentModal').classList.add('active');
+        // Pause video if playing
+        const video = document.querySelector('video');
+        if (video) video.pause();
+    }
+    
+    function closePaymentModal() {
+        document.getElementById('paymentModal').classList.remove('active');
+    }
+    
+    async function initPayment() {
+        try {
+            const response = await fetch('/api/create-payment', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({
+                    ticket: currentTicket,
+                    user_id: tg.initDataUnsafe?.user?.id || 0
+                })
+            });
+            
+            const data = await response.json();
+            
+            if (data.success) {
+                // Open TON payment URL
+                window.open(data.payment_url, '_blank');
+                
+                // Poll for payment confirmation
+                checkPaymentStatus(data.payment_id);
+            } else {
+                alert('خطأ في إنشاء الدفع: ' + data.error);
+            }
+        } catch (error) {
+            alert('خطأ في الاتصال');
+        }
+    }
+    
+    async function checkPaymentStatus(paymentId) {
+        const interval = setInterval(async () => {
+            try {
+                const response = await fetch('/api/check-payment', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        payment_id: paymentId,
+                        ticket: currentTicket,
+                        user_id: tg.initDataUnsafe?.user?.id || 0
+                    })
+                });
+                
+                const data = await response.json();
+                
+                if (data.paid) {
+                    clearInterval(interval);
+                    closePaymentModal();
+                    clearInterval(timerInterval);
+                    document.getElementById('timerOverlay').style.display = 'none';
+                    
+                    // Reload content with full access
+                    searchTicket();
+                }
+            } catch (error) {
+                console.error('Error checking payment:', error);
+            }
+        }, 3000); // Check every 3 seconds
+    }
+    
+    // Prevent video download
+    document.addEventListener('DOMContentLoaded', function() {
+        document.addEventListener('contextmenu', e => e.preventDefault());
+    });
+</script>
+```
 
-def main():
-    log.info("⚡ EarlySpike starting…")
+</body>
+</html>
+"""
 
-    db  = DB()
-    okx = OKX()
-    det = Detector(okx, db)
-    tw  = Twitter(db)
-    bot = Bot(db, okx, det, tw)
-    mon = Monitor(db, okx, bot)
-    app = bot.build()
+# Helper Functions
 
-    # Flask keep-alive in background thread
-    threading.Thread(target=run_flask, daemon=True).start()
-    log.info(f"🌐 Flask on port {PORT}")
+def generate_ticket():
+“”“Generate unique 8-character ticket ID”””
+return secrets.token_urlsafe(6)[:8]
 
-    async def post_init(application: Application):
-        asyncio.create_task(engine(bot, det, mon, db))
-        log.info("✅ EarlySpike fully operational!")
+def add_watermark(image_bytes, text=”@GoreSignal”):
+“”“Add watermark to image”””
+try:
+img = Image.open(BytesIO(image_bytes))
+draw = ImageDraw.Draw(img)
 
-    app.post_init = post_init
-    log.info("🤖 Starting polling…")
-    app.run_polling(drop_pending_updates=True)
+```
+    # Try to use a font, fallback to default
+    try:
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 30)
+    except:
+        font = ImageFont.load_default()
+    
+    # Add watermark in multiple positions
+    width, height = img.size
+    positions = [
+        (50, 50), (width - 200, 50),
+        (50, height - 80), (width - 200, height - 80),
+        (width // 2 - 100, height // 2)
+    ]
+    
+    for pos in positions:
+        draw.text(pos, text, fill=(255, 255, 255, 128), font=font)
+    
+    # Convert back to bytes
+    output = BytesIO()
+    img.save(output, format='JPEG')
+    return output.getvalue()
+except Exception as e:
+    logger.error(f"Watermark error: {e}")
+    return image_bytes
+```
 
+def cleanup_expired_tickets():
+“”“Remove expired tickets”””
+current_time = datetime.now()
+expired = []
 
-if __name__ == "__main__":
-    main()
+```
+for ticket_id, data in tickets_storage.items():
+    created_at = datetime.fromisoformat(data['created_at'])
+    if current_time - created_at > timedelta(days=TICKET_EXPIRY_DAYS):
+        expired.append(ticket_id)
+
+for ticket_id in expired:
+    del tickets_storage[ticket_id]
+    logger.info(f"Deleted expired ticket: {ticket_id}")
+```
+
+# Flask Routes
+
+@app.route(’/’)
+def index():
+return render_template_string(MINI_APP_HTML)
+
+@app.route(’/health’)
+def health():
+“”“Uptime endpoint for render.com”””
+return jsonify({“status”: “ok”, “timestamp”: datetime.now().isoformat()})
+
+@app.route(’/api/get-content’, methods=[‘POST’])
+def get_content():
+“”“API endpoint to retrieve content by ticket”””
+try:
+data = request.json
+ticket = data.get(‘ticket’, ‘’).strip()
+user_id = data.get(‘user_id’, 0)
+fingerprint = data.get(‘fingerprint’, ‘’)
+
+```
+    cleanup_expired_tickets()
+    
+    if ticket not in tickets_storage:
+        return jsonify({"success": False, "error": "تيكت غير صالح أو منتهي"})
+    
+    ticket_data = tickets_storage[ticket]
+    
+    # Check if ticket is expired
+    created_at = datetime.fromisoformat(ticket_data['created_at'])
+    if datetime.now() - created_at > timedelta(days=TICKET_EXPIRY_DAYS):
+        return jsonify({"success": False, "error": "التيكت منتهي الصلاحية"})
+    
+    # Check user access
+    user_key = str(user_id)
+    has_paid_access = False
+    
+    if user_key in user_access and ticket in user_access[user_key]:
+        user_ticket_data = user_access[user_key][ticket]
+        
+        # Check fingerprint match
+        if user_ticket_data.get('fingerprint') != fingerprint:
+            return jsonify({"success": False, "error": "تم الكشف عن محاولة وصول غير مصرح بها"})
+        
+        if user_ticket_data.get('paid'):
+            # Check if payment is still valid (3 days)
+            paid_at = datetime.fromisoformat(user_ticket_data.get('paid_at', ticket_data['created_at']))
+            if datetime.now() - paid_at <= timedelta(days=TICKET_EXPIRY_DAYS):
+                has_paid_access = True
+    else:
+        # First time viewing - record fingerprint
+        if user_key not in user_access:
+            user_access[user_key] = {}
+        user_access[user_key][ticket] = {
+            'paid': False,
+            'first_viewed_at': datetime.now().isoformat(),
+            'fingerprint': fingerprint
+        }
+    
+    return jsonify({
+        "success": True,
+        "media_type": ticket_data['media_type'],
+        "media_data": ticket_data['media_data'],
+        "title": ticket_data.get('title', ''),
+        "has_access": has_paid_access,
+        "duration": ticket_data.get('duration', 120)
+    })
+    
+except Exception as e:
+    logger.error(f"Get content error: {e}")
+    return jsonify({"success": False, "error": "خطأ في السيرفر"})
+```
+
+@app.route(’/api/create-payment’, methods=[‘POST’])
+def create_payment():
+“”“Create TON payment request”””
+try:
+data = request.json
+ticket = data.get(‘ticket’)
+user_id = data.get(‘user_id’)
+
+```
+    # Generate payment ID
+    payment_id = secrets.token_urlsafe(16)
+    
+    # Create TON payment URL (simplified - you'll need to integrate with TON Connect)
+    payment_url = f"ton://transfer/{HOT_WALLET}?amount={int(PAYMENT_AMOUNT * 1e9)}&text=Payment_{payment_id}_Ticket_{ticket}"
+    
+    return jsonify({
+        "success": True,
+        "payment_id": payment_id,
+        "payment_url": payment_url
+    })
+    
+except Exception as e:
+    logger.error(f"Create payment error: {e}")
+    return jsonify({"success": False, "error": str(e)})
+```
+
+@app.route(’/api/check-payment’, methods=[‘POST’])
+def check_payment():
+“”“Check if payment was completed”””
+try:
+data = request.json
+payment_id = data.get(‘payment_id’)
+ticket = data.get(‘ticket’)
+user_id = str(data.get(‘user_id’))
+
+```
+    # TODO: Implement actual TON payment verification using TON Center API
+    # For now, this is a placeholder
+    
+    # Simulate payment verification (replace with actual API call)
+    paid = False  # Set to True when payment is verified
+    
+    if paid:
+        # Grant access
+        if user_id not in user_access:
+            user_access[user_id] = {}
+        
+        user_access[user_id][ticket] = {
+            'paid': True,
+            'paid_at': datetime.now().isoformat(),
+            'fingerprint': user_access[user_id].get(ticket, {}).get('fingerprint', '')
+        }
+        
+        # Notify admin
+        asyncio.create_task(notify_admin_payment(user_id, ticket, payment_id))
+    
+    return jsonify({"paid": paid})
+    
+except Exception as e:
+    logger.error(f"Check payment error: {e}")
+    return jsonify({"paid": False})
+```
+
+# Telegram Bot Handlers
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+“”“Handle /start command”””
+user_id = update.effective_user.id
+
+```
+if user_id == ADMIN_ID:
+    # Get the app URL from environment or use ngrok/render URL
+    app_url = os.environ.get("RENDER_EXTERNAL_URL", "https://your-app.onrender.com")
+    
+    await update.message.reply_text(
+        f"🔥 مرحباً بك أيها الأدمن!\n\n"
+        f"🌐 رابط التطبيق:\n{app_url}\n\n"
+        f"📤 أرسل محتوى (فيديو/صورة) لبدء إنشاء تيكت جديد\n"
+        f"🔗 استخدم /link لتعيين رابط ouo.io",
+        disable_web_page_preview=True
+    )
+else:
+    await update.message.reply_text(
+        "⚠️ هذا البوت مخصص للأدمن فقط!\n"
+        "للوصول للمحتوى، استخدم التطبيق المصغر."
+    )
+```
+
+async def link_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+“”“Handle /link command to set ouo.io link”””
+global ouo_link
+
+```
+if update.effective_user.id != ADMIN_ID:
+    return
+
+if context.args:
+    ouo_link = context.args[0]
+    await update.message.reply_text(f"✅ تم تعيين الرابط:\n{ouo_link}")
+else:
+    await update.message.reply_text(
+        f"📎 الرابط الحالي:\n{ouo_link if ouo_link else 'لم يتم التعيين'}\n\n"
+        f"لتغيير الرابط: /link <رابط_جديد>"
+    )
+```
+
+async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
+“”“Handle media uploads from admin”””
+if update.effective_user.id != ADMIN_ID:
+return
+
+```
+try:
+    # Generate ticket
+    ticket_id = generate_ticket()
+    
+    # Ask for title
+    await update.message.reply_text(
+        f"🎫 تم إنشاء التيكت: `{ticket_id}`\n\n"
+        f"📝 أرسل عنوان المحتوى:",
+        parse_mode='Markdown'
+    )
+    
+    # Store media temporarily
+    media_type = None
+    media_data = None
+    duration = 120  # Default
+    
+    if update.message.photo:
+        # Get highest quality photo
+        photo = update.message.photo[-1]
+        file = await context.bot.get_file(photo.file_id)
+        photo_bytes = await file.download_as_bytearray()
+        
+        # Add watermark
+        watermarked = add_watermark(bytes(photo_bytes))
+        media_data = base64.b64encode(watermarked).decode()
+        media_type = 'image'
+        duration = 30
+        
+    elif update.message.video:
+        video = update.message.video
+        file = await context.bot.get_file(video.file_id)
+        video_bytes = await file.download_as_bytearray()
+        
+        media_data = base64.b64encode(bytes(video_bytes)).decode()
+        media_type = 'video'
+        duration = video.duration if video.duration else 120
+        
+    elif update.message.document:
+        document = update.message.document
+        if document.mime_type and 'video' in document.mime_type:
+            file = await context.bot.get_file(document.file_id)
+            video_bytes = await file.download_as_bytearray()
+            media_data = base64.b64encode(bytes(video_bytes)).decode()
+            media_type = 'video'
+        elif document.mime_type and 'image' in document.mime_type:
+            file = await context.bot.get_file(document.file_id)
+            image_bytes = await file.download_as_bytearray()
+            watermarked = add_watermark(bytes(image_bytes))
+            media_data = base64.b64encode(watermarked).decode()
+            media_type = 'image'
+            duration = 30
+    
+    if media_data:
+        # Store ticket
+        tickets_storage[ticket_id] = {
+            'media_type': media_type,
+            'media_data': media_data,
+            'created_at': datetime.now().isoformat(),
+            'title': '',  # Will be updated
+            'duration': duration
+        }
+        
+        # Store context for title
+        context.user_data['pending_ticket'] = ticket_id
+        
+except Exception as e:
+    logger.error(f"Handle media error: {e}")
+    await update.message.reply_text(f"❌ خطأ: {str(e)}")
+```
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+“”“Handle text messages (titles)”””
+if update.effective_user.id != ADMIN_ID:
+return
+
+```
+# Check if there's a pending ticket
+pending_ticket = context.user_data.get('pending_ticket')
+
+if pending_ticket and pending_ticket in tickets_storage:
+    title = update.message.text
+    tickets_storage[pending_ticket]['title'] = title
+    
+    # Post to group
+    await post_to_group(context.bot, pending_ticket, title)
+    
+    # Clear pending
+    context.user_data.pop('pending_ticket', None)
+    
+    await update.message.reply_text(
+        f"✅ تم نشر المحتوى بنجاح!\n\n"
+        f"🎫 التيكت: `{pending_ticket}`\n"
+        f"📝 العنوان: {title}",
+        parse_mode='Markdown'
+    )
+```
+
+async def post_to_group(bot, ticket_id, title):
+“”“Post content to group with watermarked preview”””
+try:
+ticket_data = tickets_storage[ticket_id]
+
+```
+    # Create inline keyboard
+    keyboard = [[InlineKeyboardButton("🔥 شاهد مجاناً", url=ouo_link if ouo_link else "https://t.me/your_bot")]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    message_text = (
+        f"🔥 {title}\n\n"
+        f"🎫 التيكت: `{ticket_id}`\n\n"
+        f"📌 كيفية المشاهدة:\n"
+        f"1️⃣ انسخ التيكت أعلاه\n"
+        f"2️⃣ اضغط على الزر بالأسفل\n"
+        f"3️⃣ الصق التيكت في التطبيق"
+    )
+    
+    # Send preview (watermarked thumbnail)
+    if ticket_data['media_type'] == 'image':
+        image_bytes = base64.b64decode(ticket_data['media_data'])
+        await bot.send_photo(
+            chat_id=GROUP_CHAT_ID,
+            photo=BytesIO(image_bytes),
+            caption=message_text,
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+    else:
+        await bot.send_message(
+            chat_id=GROUP_CHAT_ID,
+            text=message_text,
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+        
+except Exception as e:
+    logger.error(f"Post to group error: {e}")
+```
+
+async def notify_admin_payment(user_id, ticket, payment_id):
+“”“Notify admin about payment”””
+try:
+bot = telegram_app.bot
+await bot.send_message(
+chat_id=ADMIN_ID,
+text=(
+f”💰 دفعة جديدة!\n\n”
+f”👤 المستخدم: {user_id}\n”
+f”🎫 التيكت: {ticket}\n”
+f”💳 معرف الدفع: {payment_id}\n”
+f”💵 المبلغ: {PAYMENT_AMOUNT} TON”
+)
+)
+except Exception as e:
+logger.error(f”Notify admin error: {e}”)
+
+# Initialize Telegram Bot
+
+telegram_app = Application.builder().token(BOT_TOKEN).build()
+
+telegram_app.add_handler(CommandHandler(“start”, start_command))
+telegram_app.add_handler(CommandHandler(“link”, link_command))
+telegram_app.add_handler(MessageHandler(filters.PHOTO | filters.VIDEO | filters.Document.ALL, handle_media))
+telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
+# Run both Flask and Telegram bot
+
+def run_flask():
+“”“Run Flask app”””
+app.run(host=‘0.0.0.0’, port=PORT)
+
+def run_telegram():
+“”“Run Telegram bot”””
+asyncio.set_event_loop(asyncio.new_event_loop())
+telegram_app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+if **name** == ‘**main**’:
+# Start Flask in separate thread
+flask_thread = Thread(target=run_flask)
+flask_thread.start()
+
+```
+# Run Telegram bot in main thread
+run_telegram()
+```
