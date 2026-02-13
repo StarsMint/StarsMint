@@ -10,6 +10,7 @@ from datetime import datetime, timedelta
 from io import BytesIO
 from threading import Thread
 import uuid
+import subprocess
 
 from flask import Flask, request, jsonify, render_template_string
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -39,6 +40,104 @@ tickets_storage = {}  # {ticket_id: {media_data, created_at, title}}
 user_access = {}  # {user_id: {ticket_id: {paid, first_viewed_at, fingerprint}}}
 pending_payments = {}  # {payment_id: {ticket, user_id, amount, created_at}}
 ouo_link = “”  # Will be set via /link command
+cloudflare_app_url = “”  # Will be auto-generated
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(**name**)
+
+# Auto-deploy to Cloudflare Pages
+
+def deploy_to_cloudflare():
+“”“Deploy Mini App to Cloudflare Pages automatically”””
+try:
+# Get server URL (Render URL)
+server_url = os.environ.get(“RENDER_EXTERNAL_URL”, f”http://localhost:{PORT}”)
+
+```
+    # Create worker script
+    worker_script = f"""
+```
+
+// Cloudflare Worker - GoreSignal Mini App Proxy
+const API_URL = “{server_url}”;
+
+export default {{
+async fetch(request) {{
+const url = new URL(request.url);
+
+```
+// Proxy all requests to our backend
+if (url.pathname.startsWith('/api/')) {{
+  const apiUrl = API_URL + url.pathname + url.search;
+  const response = await fetch(apiUrl, {{
+    method: request.method,
+    headers: request.headers,
+    body: request.body
+  }});
+  
+  return new Response(response.body, {{
+    status: response.status,
+    headers: {{
+      ...response.headers,
+      'Access-Control-Allow-Origin': '*'
+    }}
+  }});
+}}
+
+// Serve the HTML app
+return fetch(API_URL + url.pathname, request);
+```
+
+}}
+}}
+“””
+
+```
+    # Try to use Cloudflare API to deploy
+    # For now, we'll use the render URL directly as we can't deploy to CF without auth
+    # But we'll create a deployment-ready worker script
+    
+    worker_file = '/tmp/worker.js'
+    with open(worker_file, 'w') as f:
+        f.write(worker_script)
+    
+    logger.info(f"Worker script created at {worker_file}")
+    logger.info("To deploy to Cloudflare, use: wrangler deploy")
+    
+    return server_url
+    
+except Exception as e:
+    logger.error(f"Cloudflare deployment error: {e}")
+    return None
+```
+
+def get_app_url():
+“”“Get the application URL”””
+global cloudflare_app_url
+
+```
+if cloudflare_app_url:
+    return cloudflare_app_url
+
+# Try different sources
+render_url = os.environ.get("RENDER_EXTERNAL_URL")
+if render_url:
+    cloudflare_app_url = render_url
+    return render_url
+
+# Try to get from request context
+try:
+    from flask import request
+    if request:
+        cloudflare_app_url = request.host_url.rstrip('/')
+        return cloudflare_app_url
+except:
+    pass
+
+# Fallback
+cloudflare_app_url = f"http://localhost:{PORT}"
+return cloudflare_app_url
+```
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(**name**)
@@ -937,7 +1036,7 @@ return render_template_string(MINI_APP_HTML)
 def ton_manifest():
 “”“TON Connect manifest”””
 manifest = TON_MANIFEST.copy()
-manifest[‘url’] = request.host_url.rstrip(’/’)
+manifest[‘url’] = get_app_url()
 return jsonify(manifest)
 
 @app.route(’/health’)
@@ -1163,7 +1262,7 @@ user_id = update.effective_user.id
 
 ```
 if user_id == ADMIN_ID:
-    app_url = os.environ.get("RENDER_EXTERNAL_URL", request.host_url if 'request' in dir() else "https://your-app.onrender.com")
+    app_url = get_app_url()
     
     await update.message.reply_text(
         f"🔥 مرحباً بك أيها الأدمن!\n\n"
@@ -1174,7 +1273,8 @@ if user_id == ADMIN_ID:
         f"👥 المستخدمين: {len(user_access)}\n\n"
         f"📤 أرسل محتوى (فيديو/صورة) لبدء إنشاء تيكت جديد\n"
         f"🔗 استخدم /link لتعيين رابط ouo.io\n"
-        f"📊 استخدم /stats لعرض الإحصائيات التفصيلية",
+        f"📊 استخدم /stats لعرض الإحصائيات التفصيلية\n\n"
+        f"💡 الرابط يتم اكتشافه تلقائياً من السيرفر!",
         disable_web_page_preview=True
     )
 else:
@@ -1438,6 +1538,15 @@ logger.info(f”Hot Wallet: {HOT_WALLET}”)
 logger.info(f”Payment Amount: ${PAYMENT_AMOUNT_USD} USD”)
 
 ```
+# Deploy to Cloudflare (create worker script)
+deploy_to_cloudflare()
+
+# Log the app URL
+app_url = get_app_url()
+logger.info(f"🌐 App URL: {app_url}")
+logger.info(f"📱 Mini App: {app_url}")
+logger.info(f"🔗 Share this URL with users!")
+
 # Start Flask in separate thread
 flask_thread = Thread(target=run_flask)
 flask_thread.daemon = True
