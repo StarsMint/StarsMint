@@ -255,10 +255,6 @@ MINI_APP_HTML = """
             <div style="margin-top: 20px; padding-top: 20px; border-top: 1px solid rgba(255,255,255,0.2);">
                 <p style="font-size: 14px; color: #aaa;">Or pay manually:</p>
                 
-                <button onclick="payWithDeepLink()" style="background: #0098ea; margin-bottom: 15px;">
-                    Open Wallet App ↗️
-                </button>
-
                 <p style="font-size: 14px; color: #aaa;">Or copy address:</p>
                 <div class="wallet-address" id="walletAddress" onclick="copyWallet()">
                     UQABSEcWzJVmtLdZDUMyCs5EGrKOHWKWq3ftFNY0IItHgYTa
@@ -594,36 +590,7 @@ MINI_APP_HTML = """
                 requiredTonAmount = 0.20;
             }
         }
-        
-        async function payWithDeepLink() {
-            try {
-                // 1. جلب بيانات الدفع من السيرفر
-                const response = await fetch("/api/create-payment", {
-                    method: "POST",
-                    headers: {"Content-Type": "application/json"},
-                    body: JSON.stringify({
-                        ticket: currentTicket,
-                        user_id: tg.initDataUnsafe?.user?.id || 0
-                    })
-                });
                 
-                const data = await response.json();
-                
-                if (data.success) {
-                    // 2. إخفاء النافذة فوراً (الحل الجذري)
-                    document.getElementById("paymentModal").style.display = "none";
-                    
-                    // 3. تشغيل المراقب في الخلفية
-                    checkPaymentStatus(data.payment_id);
-                    
-                    // 4. فتح المحفظة
-                    window.location.href = `ton://transfer/${data.wallet_address}?amount=${data.amount_nano}&text=${data.comment}`;
-                }
-            } catch (e) {
-                alert("Error connecting");
-            }
-        }
-        
         async function checkPaymentStatus(paymentId) {
             document.getElementById("paymentStatus").style.display = "block";
             
