@@ -1,8 +1,5 @@
-Flask
-python-telegram-bot
+ccxt
+pandas
+numby
 requests
-Pillow
-gunicorn
-pytoniq
-pytoniq-core
-tonsdk
+scipy
