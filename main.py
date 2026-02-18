@@ -10,8 +10,8 @@ from scipy.optimize import curve_fit
 # ---------------------------------------------------------
 # [CONFIG] منطقة الإعدادات السرية
 # ---------------------------------------------------------
-API_KEY = "ضع_مفتاح_API_الخاص_بك_هنا"
-SECRET_KEY = "ضع_مفتاح_السر_الخاص_بك_هنا"
+API_KEY = "263d6dec-23fd-41fb-bd8d-6ba9f626ca1c"
+SECRET_KEY = "68BF1CE4388551F4AE9B5E8E3AFD1F23"
 PASSPHRASE = "Olpolp2004$" 
 
 TELEGRAM_TOKEN = "8576670268:AAEITh1HLZ29Mu_muscP9sls7oE8ku_lY2g"
@@ -20,7 +20,7 @@ CHAT_ID = "1801208219"
 # إعدادات المحاكاة
 INITIAL_BALANCE = 20.0  # رصيد البداية
 LEVERAGE = 1  # تداول فوري (سبوت) للمحاكاة العلمية
-FEE_RATE = 0.001  # 0.1% رسوم OKX
+FEE_RATE = 0.002  # 0.1% رسوم OKX
 
 # ---------------------------------------------------------
 # [MATH CORE] المحرك الرياضي (Hurst + Kalman)
