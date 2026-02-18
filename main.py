@@ -6,6 +6,22 @@ import time
 import gc
 from datetime import datetime
 from scipy.optimize import curve_fit
+import threading
+import os
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+# --- دالة الخادم الوهمي لمنع توقف Render ---
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is Alive!")
+
+def run_dummy_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
+    server.serve_forever()
+# ----------------------------------------
 
 # ---------------------------------------------------------
 # [CONFIG] منطقة الإعدادات السرية
@@ -288,10 +304,16 @@ class QuantBot:
                     self.send_msg("⚠️ لا توجد فرص تتوافق مع الشروط الرياضية الصارمة حالياً.")
 
             # 3. تنظيف الرام والانتظار
+# --- نهاية الكود ---
             gc.collect()
             time.sleep(300) # 5 دقائق انتظار
 
-# تشغيل البوت
+# تشغيل البوت (هنا الترتيب الصحيح)
 if __name__ == "__main__":
+    # 1. أولاً: نشغل الخادم الوهمي في خلفية النظام
+    import threading 
+    threading.Thread(target=run_dummy_server, daemon=True).start()
+    
+    # 2. ثانياً: نشغل البوت ليبدأ العمل
     bot = QuantBot()
     bot.run()
