@@ -30,7 +30,7 @@ API_KEY = "263d6dec-23fd-41fb-bd8d-6ba9f626ca1c"
 SECRET_KEY = "68BF1CE4388551F4AE9B5E8E3AFD1F23"
 PASSPHRASE = "Olpolp2004$" 
 
-TELEGRAM_TOKEN = "8576670268:AAEITh1HLZ29Mu_muscP9sls7oE8ku_lY2g"
+TELEGRAM_TOKEN = "8576670268:AAEFDeNCWo0u47l13bAWawi8my2a3dj2q6Y"
 CHAT_ID = "1801208219"
 
 # إعدادات المحاكاة
@@ -96,7 +96,13 @@ class QuantBot:
         self.active_trade = None
         self.trades_history = []
         self.running = True
-        self.pairs = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT', 'ADA/USDT'] # الأزواج المستهدفة
+        self.pairs = [
+            'BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT', 'ADA/USDT',
+            'DOGE/USDT', 'DOT/USDT', 'LINK/USDT', 'LTC/USDT', 'BCH/USDT',
+            'MATIC/USDT', 'UNI/USDT', 'AVAX/USDT', 'ATOM/USDT', 'ETC/USDT',
+            'FIL/USDT', 'SAND/USDT', 'APE/USDT', 'NEAR/USDT', 'ALGO/USDT'
+        ]
+ # الأزواج المستهدفة
 
     def send_msg(self, text):
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
